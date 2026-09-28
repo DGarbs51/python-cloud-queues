@@ -10,6 +10,7 @@ import asyncio
 import json
 import os
 import random
+import socket
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -133,10 +134,21 @@ class Handler(BaseHTTPRequestHandler):
         pass  # the dashboard polls every second; keep the console readable
 
 
+class DualStackServer(ThreadingHTTPServer):
+    """Listens on IPv6 and IPv4. Laravel Cloud's cluster network is IPv6."""
+
+    address_family = socket.AF_INET6
+
+    def server_bind(self) -> None:
+        self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+        super().server_bind()
+
+
 if __name__ == "__main__":
     telemetry.store.ping()  # fail fast without a Valkey cache
     # Laravel Cloud sets PORT and proxies to it, so listen on every interface there.
-    host = os.environ.get("HOST") or ("0.0.0.0" if "PORT" in os.environ else "127.0.0.1")
+    host = os.environ.get("HOST") or ("::" if "PORT" in os.environ else "127.0.0.1")
     port = int(os.environ.get("PORT", "8000"))
-    print(f"Dashboard on http://{host}:{port}", flush=True)
-    ThreadingHTTPServer((host, port), Handler).serve_forever()
+    server = DualStackServer if ":" in host else ThreadingHTTPServer
+    print(f"Dashboard on {host} port {port}", flush=True)
+    server((host, port), Handler).serve_forever()
