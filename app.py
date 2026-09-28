@@ -1,115 +1,80 @@
-"""Plain-Python demo for laravel-cloud-queues (Redis backend).
+"""Plain-Python demo for laravel-cloud-queues.
 
 Web dashboard: uv run python app.py                         (http://127.0.0.1:8000)
 Worker:        uv run laravel-cloud-queues work app:registry
-
-The package emits no lifecycle events in redis mode, so jobs record their own telemetry
-into Redis under ``lcq-demo:``; queue depth is read from the package's Redis keys.
 """
 
 from __future__ import annotations
 
 import asyncio
-import functools
 import json
 import os
 import random
-import socket
 import time
-from collections.abc import Iterator
-from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-import redis
-
-from laravel_cloud_queues import Registry, __version__, current_job
+from laravel_cloud_queues import Registry, current_job
+from telemetry import (
+    BURST_SIZE,
+    CHECK_KINDS,
+    DELAY_SECONDS,
+    TIMEOUT_SECONDS,
+    Telemetry,
+)
 
 registry = Registry()
-
-EVENTS = "lcq-demo:events"
-STATS = "lcq-demo:stats"
-KEEP_EVENTS = 200
+telemetry = Telemetry(registry, "Plain Python")
 INDEX = Path(__file__).with_name("index.html")
-
-
-@functools.cache
-def store() -> redis.Redis:
-    if registry.config.redis is None:
-        raise SystemExit("Set LARAVEL_CLOUD_QUEUES_BACKEND=redis; this demo targets Redis.")
-    return redis.Redis.from_url(registry.config.redis.url, decode_responses=True)
-
-
-def record(event: str, **fields: object) -> None:
-    entry = {"event": event, "at": time.time(), **fields}
-    pipe = store().pipeline()
-    pipe.lpush(EVENTS, json.dumps(entry))
-    pipe.ltrim(EVENTS, 0, KEEP_EVENTS - 1)
-    pipe.hincrby(STATS, event, 1)
-    pipe.execute()
-
-
-@contextmanager
-def tracked() -> Iterator[None]:
-    """Record started/processed/released/failed for the current delivery."""
-    job = current_job()
-    base = {
-        "job": job.job_name,
-        "uuid": job.uuid,
-        "attempt": job.attempt,
-        "worker": f"{socket.gethostname()}:{os.getpid()}",
-    }
-    record("started", **base)
-    start = time.monotonic()
-    try:
-        yield
-    except Exception as exc:
-        final = job.attempt >= job.max_tries
-        ms = round((time.monotonic() - start) * 1000)
-        record("failed" if final else "released", **base, ms=ms, error=str(exc)[:200])
-        raise
-    record("processed", **base, ms=round((time.monotonic() - start) * 1000))
 
 
 @registry.job(name="demo.quick")
 def quick() -> None:
-    with tracked():
+    with telemetry.tracked():
         time.sleep(random.uniform(0.05, 0.3))
 
 
 @registry.job(name="demo.async")
 async def async_job() -> None:
-    with tracked():
+    with telemetry.tracked():
         await asyncio.sleep(random.uniform(0.05, 0.3))
 
 
 @registry.job(name="demo.slow")
 def slow() -> None:
-    with tracked():
+    with telemetry.tracked():
         time.sleep(3)
 
 
 @registry.job(name="demo.flaky", tries=3, backoff=[2])
 def flaky() -> None:
-    with tracked():
+    with telemetry.tracked():
         if current_job().attempt == 1:
             raise RuntimeError("flaky job fails on its first attempt")
 
 
 @registry.job(name="demo.failing", tries=2, backoff=[1])
 def failing() -> None:
-    with tracked():
+    with telemetry.tracked():
         raise RuntimeError("this job always fails")
+
+
+@registry.job(name="demo.timeout", tries=2, timeout=TIMEOUT_SECONDS)
+def timeout() -> None:
+    # Exceeds its timeout: the worker exits 124 and the platform restarts it.
+    with telemetry.tracked():
+        time.sleep(TIMEOUT_SECONDS + 7)
 
 
 DISPATCHES = {  # kind: (job, delay seconds, how many)
     "quick": (quick, 0, 1),
     "async": (async_job, 0, 1),
     "slow": (slow, 0, 1),
-    "delayed": (quick, 5, 1),
+    "delayed": (quick, DELAY_SECONDS, 1),
     "flaky": (flaky, 0, 1),
     "failing": (failing, 0, 1),
-    "burst": (quick, 0, 25),
+    "timeout": (timeout, 0, 1),
+    "burst": (quick, 0, BURST_SIZE),
 }
 
 
@@ -119,34 +84,13 @@ def dispatch(kind: str) -> list[str]:
     for _ in range(count):
         at = time.time()
         receipt = job.options(delay=delay).dispatch()
-        record("queued", at=at, job=job.name, uuid=receipt.uuid, delay=delay)
+        telemetry.queued(job.name, receipt.uuid, at, delay)
         uuids.append(receipt.uuid)
     return uuids
 
 
-def snapshot() -> dict[str, object]:
-    cfg = registry.config.redis
-    pending = f"{cfg.prefix}queues:{cfg.queue}"
-    pipe = store().pipeline()
-    pipe.llen(pending)
-    pipe.zcard(f"{pending}:delayed")
-    pipe.zcard(f"{pending}:reserved")
-    pipe.hgetall(STATS)
-    pipe.lrange(EVENTS, 0, 99)
-    ready, delayed, reserved, counts, events = pipe.execute()
-    parsed = sorted((json.loads(e) for e in events), key=lambda e: e["at"], reverse=True)
-    return {
-        "framework": "Plain Python",
-        "version": __version__,
-        "queue": cfg.queue,
-        "depth": {"ready": ready, "delayed": delayed, "reserved": reserved},
-        "counts": {k: int(v) for k, v in counts.items()},
-        "events": parsed,
-    }
-
-
-def reset() -> None:
-    store().delete(EVENTS, STATS)
+def run_check() -> None:
+    telemetry.save_check({kind: dispatch(kind) for kind in CHECK_KINDS})
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -154,7 +98,7 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/":
             self._send(200, INDEX.read_bytes(), "text/html; charset=utf-8")
         elif self.path == "/api/stats":
-            self._json(200, snapshot())
+            self._json(200, telemetry.snapshot())
         else:
             self._json(404, {"error": "not found"})
 
@@ -165,7 +109,10 @@ class Handler(BaseHTTPRequestHandler):
             return
         kind = self.path.removeprefix("/api/dispatch/")
         if self.path == "/api/reset":
-            reset()
+            telemetry.reset()
+            self._json(200, {"ok": True})
+        elif self.path == "/api/check":
+            run_check()
             self._json(200, {"ok": True})
         elif kind in DISPATCHES:
             self._json(200, {"uuids": dispatch(kind)})
@@ -187,8 +134,9 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    store()  # fail fast on a missing backend
-    host = os.environ.get("HOST", "127.0.0.1")
+    telemetry.store.ping()  # fail fast without a Valkey cache
+    # Laravel Cloud sets PORT and proxies to it, so listen on every interface there.
+    host = os.environ.get("HOST") or ("0.0.0.0" if "PORT" in os.environ else "127.0.0.1")
     port = int(os.environ.get("PORT", "8000"))
-    print(f"Dashboard on http://{host}:{port}")
+    print(f"Dashboard on http://{host}:{port}", flush=True)
     ThreadingHTTPServer((host, port), Handler).serve_forever()
