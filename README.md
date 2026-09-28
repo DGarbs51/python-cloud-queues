@@ -36,7 +36,7 @@ git switch main
 2. Attach a Laravel Valkey cache. Cloud injects `REDIS_URL`.
 3. Set `LARAVEL_CLOUD_QUEUES_BACKEND=redis`.
 4. Leave the build command empty; Cloud installs dependencies with uv from `uv.lock`.
-5. Set the start command to `python app.py`. It listens on `0.0.0.0:$PORT` whenever `PORT` is set. Cloud auto-detects FastAPI apps; this plain-Python one has not been deployed yet, so check that Cloud accepts the start command.
+5. Set the start command to `python app.py`. It listens on `$PORT` over IPv6 and IPv4 whenever `PORT` is set (Cloud's cluster network is IPv6). Cloud auto-detects FastAPI apps; this plain-Python one has not been deployed yet, so check that Cloud accepts the start command.
 6. Create a worker cluster that runs the queue worker as **4 processes**, each with:
 
    ```sh
