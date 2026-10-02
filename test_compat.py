@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import os
 import sys
 import time
 
@@ -31,6 +33,20 @@ for r in results:
     # Language-feature probes are deterministic for a given interpreter, so a failure there is a probe bug.
     if r["group"] in {"version", "syntax"}:
         assert r["status"] != "fail", r
+
+# Credentials must never reach a detail string, even when a URL is malformed and the parser's error echoes it.
+# U+FF0F (fullwidth solidus) makes urlsplit() raise a ValueError that quotes the whole netloc.
+os.environ.update(
+    DATABASE_URL="mysql://dbuser:SYNTHETIC_DB%40PW@db\uff0f.invalid/app",
+    REDIS_URL="redis://:SYNTHETIC_REDIS_PW@cache\uff0f.invalid:6379/0",
+    DB_PASSWORD="SYNTHETIC_RAW/PW",
+)
+leaked = json.dumps(compat.run_probes())
+for secret in ("SYNTHETIC", "dbuser", "DB%40PW", "DB@PW", "RAW/PW", "RAW%2FPW"):
+    assert secret not in leaked, f"{secret!r} leaked into probe details"
+assert compat._sanitize("see https://u:p@host/x and redis://:pw@h") == "see https://***@host/x and redis://***@h"
+for name in ("DATABASE_URL", "REDIS_URL", "DB_PASSWORD"):
+    del os.environ[name]
 
 for r in results:
     if r["status"] == "fail":

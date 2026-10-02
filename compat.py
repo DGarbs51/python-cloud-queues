@@ -7,7 +7,8 @@ It never raises and never signals the calling process. Anything that can block
 or crash (DNS, outbound HTTPS, multiprocessing, signals, subinterpreters, DB)
 runs in a child interpreter that is killed with its whole process group after
 CHILD_TIMEOUT. All probes run concurrently and run_probes() returns within
-BUDGET seconds even if a probe hangs. Newer syntax is checked by compiling
+BUDGET seconds even if a probe hangs. Every detail string passes through _sanitize(),
+which removes URL credentials and the DB/Redis passwords found in the environment. Newer syntax is checked by compiling
 source strings, so this module imports on Python 3.10.
 
 Must import and run on Python 3.10 through 3.14.
@@ -19,12 +20,14 @@ from __future__ import annotations
 import asyncio
 import builtins
 import codecs
+import contextvars
 import importlib
 import importlib.util
 import json
 import locale
 import os
 import platform
+import re
 import shutil
 import signal
 import site
@@ -37,9 +40,8 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, wait
 from datetime import datetime
-from importlib import metadata
 from typing import Callable
-from urllib.parse import urlsplit
+from urllib.parse import quote, unquote, urlsplit
 
 CHILD_TIMEOUT = 10
 BUDGET = 25.0
@@ -56,6 +58,9 @@ OPTIONAL_DEPS = {
     "laravel_cloud_queues": "laravel-cloud-queues",
     "certifi": "certifi",
 }
+SECRET_URLS = ("DATABASE_URL", "REDIS_URL", "LARAVEL_CLOUD_QUEUES_REDIS_URL")
+SECRET_VALUES = ("DB_PASSWORD", "REDIS_PASSWORD")
+USERINFO = re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://)[^\s/@]*@")
 
 PROBES: list[tuple[str, str, tuple[int, int], Callable[[], tuple[str, str]]]] = []
 
@@ -68,17 +73,56 @@ def probe(name: str, group: str, min_python: tuple[int, int] = (3, 10)):
     return register
 
 
+class _Run:
+    """Per-call state shared with _child(): the deadline and the children still running."""
+
+    def __init__(self, deadline: float) -> None:
+        self.deadline = deadline
+        self.lock = threading.Lock()
+        self.children: set[subprocess.Popen] = set()
+        self.closed = False
+
+
+_RUN: contextvars.ContextVar[_Run | None] = contextvars.ContextVar("compat_run", default=None)
+
+
 def run_probes() -> list[dict[str, str]]:
     started = time.monotonic()
-    pool = ThreadPoolExecutor(max_workers=16, thread_name_prefix="compat")
-    futures = [pool.submit(_run_one, *entry) for entry in PROBES]
-    wait(futures, timeout=BUDGET)
-    # Unfinished probes keep their thread until their own child timeout reaps them.
-    pool.shutdown(wait=False, cancel_futures=True)
+    run = _Run(started + BUDGET)
+    token = _RUN.set(run)
+    pool = None
+    futures = []
+    scheduling_error = ""
+    try:
+        pool = ThreadPoolExecutor(max_workers=16, thread_name_prefix="compat")
+        for entry in PROBES:
+            # Each probe gets its own context copy so _child() can find this run's state.
+            futures.append(pool.submit(contextvars.copy_context().run, _run_one, *entry))
+    except Exception as exc:  # noqa: BLE001 - thread or PID exhaustion must not raise to the caller
+        scheduling_error = f"could not schedule probe: {type(exc).__name__}: {exc}"
+    try:
+        # Probes submitted before a scheduling failure still get the full budget.
+        wait(futures, timeout=max(0.0, run.deadline - time.monotonic()))
+    finally:
+        _RUN.reset(token)
+        with run.lock:
+            run.closed = True
+            children = list(run.children)
+        for proc in children:
+            _signal_group(proc)
+        if children:
+            # Give the owning threads a moment to reap the children just killed.
+            wait(futures, timeout=1)
+        if pool is not None:
+            pool.shutdown(wait=False, cancel_futures=True)
+
     results = []
-    for (name, group, min_python, _), future in zip(PROBES, futures):
-        if future.done() and not future.cancelled():
+    for index, (name, group, min_python, _) in enumerate(PROBES):
+        future = futures[index] if index < len(futures) else None
+        if future is not None and future.done() and not future.cancelled() and future.exception() is None:
             results.append(future.result())
+        elif future is None and scheduling_error:
+            results.append(_entry(name, group, min_python, "fail", scheduling_error))
         else:
             elapsed = time.monotonic() - started
             results.append(_entry(name, group, min_python, "fail", f"did not finish within the {elapsed:.0f} s budget"))
@@ -96,7 +140,25 @@ def _run_one(name: str, group: str, min_python: tuple[int, int], fn: Callable[[]
 
 
 def _entry(name: str, group: str, min_python: tuple[int, int], status: str, detail: str) -> dict[str, str]:
-    return {"name": name, "group": group, "min_python": _version(min_python), "status": status, "detail": detail}
+    return {"name": name, "group": group, "min_python": _version(min_python), "status": status, "detail": _sanitize(detail)}
+
+
+def _sanitize(detail: str) -> str:
+    """Strip URL userinfo and every known credential, raw and percent-decoded, from a detail string."""
+    secrets = set()
+    for name in SECRET_URLS:
+        # Parsed by hand: urlsplit() raises on malformed URLs, and its message echoes the credentials.
+        authority = os.environ.get(name, "").partition("://")[2]
+        userinfo = authority.rpartition("@")[0]
+        if userinfo:
+            password = userinfo.partition(":")[2]
+            secrets.update({userinfo, unquote(userinfo), password, unquote(password)})
+    for name in SECRET_VALUES:
+        value = os.environ.get(name, "")
+        secrets.update({value, quote(value, safe="")})
+    for secret in sorted(filter(None, secrets), key=len, reverse=True):
+        detail = detail.replace(secret, "***")
+    return USERINFO.sub(r"\1***@", detail)
 
 
 def _version(v: tuple[int, int]) -> str:
@@ -105,6 +167,11 @@ def _version(v: tuple[int, int]) -> str:
 
 def _child(code: str, timeout: float = CHILD_TIMEOUT) -> tuple[str, str]:
     """Run code in a fresh interpreter; it must assign result = (status, detail)."""
+    run = _RUN.get()
+    if run is not None:
+        timeout = min(timeout, run.deadline - time.monotonic())
+        if timeout <= 0:
+            return "fail", "overall budget exhausted before start"
     source = textwrap.dedent(code) + "\nimport json\nprint(json.dumps(result))\n"
     proc = subprocess.Popen(
         [sys.executable, "-c", source],
@@ -114,6 +181,13 @@ def _child(code: str, timeout: float = CHILD_TIMEOUT) -> tuple[str, str]:
         text=True,
         start_new_session=True,
     )
+    if run is not None:
+        with run.lock:
+            run.children.add(proc)
+            closed = run.closed
+        if closed:
+            _kill_group(proc)
+            return "fail", "overall budget exhausted"
     try:
         out, err = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
@@ -122,6 +196,9 @@ def _child(code: str, timeout: float = CHILD_TIMEOUT) -> tuple[str, str]:
     finally:
         if proc.poll() is None:
             _kill_group(proc)
+        if run is not None:
+            with run.lock:
+                run.children.discard(proc)
     if proc.returncode != 0:
         tail = err.strip().splitlines()[-1:] or [f"exit {proc.returncode}"]
         return "fail", f"child exited {proc.returncode}: {tail[0]}"
@@ -130,12 +207,16 @@ def _child(code: str, timeout: float = CHILD_TIMEOUT) -> tuple[str, str]:
 
 
 def _kill_group(proc: subprocess.Popen) -> None:
+    _signal_group(proc)
+    proc.communicate()
+
+
+def _signal_group(proc: subprocess.Popen) -> None:
     # The child leads its own session, so this never reaches the calling process group.
     try:
         os.killpg(proc.pid, signal.SIGKILL)
     except (ProcessLookupError, PermissionError):
         pass
-    proc.communicate()
 
 
 def _exec(source: str) -> dict[str, object]:
@@ -615,21 +696,20 @@ def _user_site() -> tuple[str, str]:
 
 @probe("uid/gid", "container")
 def _uid() -> tuple[str, str]:
-    import grp
-    import pwd
-
-    uid, gid = os.getuid(), os.getgid()
-    user = pwd.getpwuid(uid).pw_name if _safe(lambda: pwd.getpwuid(uid)) else "?"
-    group = grp.getgrgid(gid).gr_name if _safe(lambda: grp.getgrgid(gid)) else "?"
-    return "info", f"uid={uid}({user}) gid={gid}({group}) euid={os.geteuid()} groups={os.getgroups()}"
-
-
-def _safe(fn: Callable[[], object]) -> bool:
-    try:
-        fn()
-        return True
-    except (KeyError, OSError):
-        return False
+    # pwd/grp go through NSS, which can block (LDAP, sssd), so the lookups run in a child.
+    return _child(
+        """
+        import grp, os, pwd
+        def name(lookup, key, attr):
+            try:
+                return getattr(lookup(key), attr)
+            except (KeyError, OSError):
+                return "?"
+        uid, gid = os.getuid(), os.getgid()
+        user, group = name(pwd.getpwuid, uid, "pw_name"), name(grp.getgrgid, gid, "gr_name")
+        result = ("info", f"uid={uid}({user}) gid={gid}({group}) euid={os.geteuid()} groups={os.getgroups()}")
+        """
+    )
 
 
 def _resolve(host: str | None, unset: str) -> tuple[str, str]:
@@ -657,7 +737,11 @@ def _resolve(host: str | None, unset: str) -> tuple[str, str]:
 def _url_host(*names: str) -> str | None:
     for name in names:
         if os.environ.get(name):
-            return urlsplit(os.environ[name]).hostname
+            try:
+                return urlsplit(os.environ[name]).hostname
+            except ValueError:
+                # The parser's message quotes the netloc, credentials included.
+                raise ValueError(f"{name} is not a valid URL") from None
     return None
 
 
@@ -674,7 +758,7 @@ def _dns_redis() -> tuple[str, str]:
 
 @probe("DNS DB host", "container")
 def _dns_db() -> tuple[str, str]:
-    return _resolve(os.environ.get("DB_HOST") or _url_host("DATABASE_URL"), "DB_HOST / DATABASE_URL not set")
+    return _resolve(_url_host("DATABASE_URL") or os.environ.get("DB_HOST"), "DATABASE_URL / DB_HOST not set")
 
 
 def _https(use_certifi: bool) -> tuple[str, str]:
@@ -766,8 +850,8 @@ def _release_vars() -> tuple[str, str]:
 
 @probe("DB TLS connect", "container")
 def _db_tls() -> tuple[str, str]:
-    if not (os.environ.get("DB_HOST") or os.environ.get("DATABASE_URL")):
-        return "skip", "DB_HOST / DATABASE_URL not set"
+    if not (os.environ.get("DATABASE_URL") or os.environ.get("DB_HOST")):
+        return "skip", "DATABASE_URL / DB_HOST not set"
     if importlib.util.find_spec("pymysql") is None:
         return "skip", "pymysql not installed"
     # The child reads credentials from its inherited environment; none are put in the source or detail.
@@ -777,14 +861,14 @@ def _db_tls() -> tuple[str, str]:
         from urllib.parse import unquote, urlsplit
         import pymysql
         env = os.environ
-        if env.get("DB_HOST"):
-            host, port = env["DB_HOST"], int(env.get("DB_PORT") or 3306)
-            user, password, database = env.get("DB_USERNAME"), env.get("DB_PASSWORD") or "", env.get("DB_DATABASE")
-        else:
+        if env.get("DATABASE_URL"):
             url = urlsplit(env["DATABASE_URL"])
             host, port = url.hostname, url.port or 3306
             user, password = unquote(url.username or ""), unquote(url.password or "")
             database = url.path.lstrip("/") or None
+        else:
+            host, port = env["DB_HOST"], int(env.get("DB_PORT") or 3306)
+            user, password, database = env.get("DB_USERNAME"), env.get("DB_PASSWORD") or "", env.get("DB_DATABASE")
         tls = env.get("DB_SSL", "1") != "0"
         context = None
         ca = "system"
@@ -818,14 +902,22 @@ def _db_tls() -> tuple[str, str]:
 
 
 def _dependency(module_name: str, dist: str) -> tuple[str, str]:
-    if importlib.util.find_spec(module_name) is None:
-        return "info", "not installed"
-    module = importlib.import_module(module_name)
-    try:
-        version = metadata.version(dist)
-    except metadata.PackageNotFoundError:
-        version = getattr(module, "__version__", "?")
-    return "pass", f"{version} from {os.path.dirname(module.__file__ or '')}"
+    # Imported in a child: native extensions can hang or crash, and the caller should not load them.
+    return _child(
+        f"""
+        import importlib, importlib.util, os
+        from importlib import metadata
+        if importlib.util.find_spec({module_name!r}) is None:
+            result = ("info", "not installed")
+        else:
+            module = importlib.import_module({module_name!r})
+            try:
+                version = metadata.version({dist!r})
+            except metadata.PackageNotFoundError:
+                version = getattr(module, "__version__", "?")
+            result = ("pass", f"{{version}} from {{os.path.dirname(module.__file__ or '')}}")
+        """
+    )
 
 
 for _module, _dist in OPTIONAL_DEPS.items():
