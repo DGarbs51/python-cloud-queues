@@ -51,8 +51,13 @@ def engine_options(url: URL, *, asynchronous: bool = False) -> dict:
     connect_args = {"connect_timeout": 5}
     local = url.host in {"localhost", "127.0.0.1", "::1"}
     if not local or os.environ.get("DB_SSL", "0") != "0":
-        connect_args["ssl"] = (ssl.create_default_context(cafile=certifi.where())
-                               if asynchronous else {"ca": certifi.where()})
+        context = ssl.create_default_context(cafile=certifi.where())
+        if os.environ.get("DB_SSL_VERIFY", "1") == "0":
+            # Laravel MySQL presents a self-signed ProxySQL certificate that no public CA bundle
+            # verifies, so Cloud environments opt out of verification: encrypted, not authenticated.
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+        connect_args["ssl"] = context
     return dict(pool_size=1, max_overflow=0, pool_pre_ping=True, pool_recycle=280,
                 connect_args=connect_args)
 

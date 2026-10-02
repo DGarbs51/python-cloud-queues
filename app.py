@@ -17,6 +17,7 @@ import platform
 import random
 import re
 import socket
+import ssl
 import sys
 import sysconfig
 import threading
@@ -732,8 +733,10 @@ def self_check() -> None:
         assert url.username == "u@x" and url.password == "p:ss"
         assert url.drivername == "mysql+pymysql"
         assert db.database_url("aiomysql").drivername == "mysql+aiomysql"
-        assert db.engine_options(url)["connect_args"]["ssl"]["ca"]
+        assert db.engine_options(url)["connect_args"]["ssl"].check_hostname
         assert db.engine_options(url, asynchronous=True)["connect_args"]["ssl"].check_hostname
+        with patch.dict(os.environ, {"DB_SSL_VERIFY": "0"}):
+            assert db.engine_options(url)["connect_args"]["ssl"].verify_mode == ssl.CERT_NONE
         for rows in (1, 3, 10):
             with patch.object(db, "create_async_engine") as create:
                 db.async_engine(rows)
