@@ -18,6 +18,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -29,6 +30,7 @@ WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 STANDIN = """
 import os
 import sys
+import time
 
 root = os.environ["L5_ROOT"]
 if root not in sys.path:
@@ -40,6 +42,9 @@ def handle(method, path, headers, body):
     route = path.split("?", 1)[0]
     if method == "GET" and route == "/api/ping":
         payload = b'{"ok": true}'
+    elif method == "GET" and route == "/api/slow":
+        time.sleep(0.6)
+        payload = b'{"slow": true}'
     elif method == "GET" and route == "/api/server-name":
         server = getattr(app, "SERVER", "")
         payload = ('{"server":"%s"}' % server).encode()
@@ -67,7 +72,9 @@ def main() -> None:
         standin = Path(directory)
         (standin / "sitecustomize.py").write_text(STANDIN)
         check_gunicorn(standin)
+        check_gunicorn_without_port(standin)
         check_uvicorn(standin)
+        check_uvicorn_workers(standin)
     print("test_servers ok")
 
 
@@ -103,6 +110,8 @@ print("bind", mod.bind)
 
     unset = run({}, ("WEB_CONCURRENCY",))
     expect(unset, "workers 1", "graceful 30", "timeout 120", "bind [::]:1234")
+    no_port = run({}, ("PORT", "WEB_CONCURRENCY"))
+    expect(no_port, "workers 1", "bind [::]:8000")
     expect(run({"WEB_CONCURRENCY": "4"}, ()), "workers 4")
     bad = run({"WEB_CONCURRENCY": "nope"}, ())
     expect(bad, "workers 1", "invalid WEB_CONCURRENCY")
@@ -128,6 +137,29 @@ def check_gunicorn(standin: Path) -> None:
         reap(proc)
     expect(text, "gunicorn workers=1 WEB_CONCURRENCY=1", "sigterm pid=")
     print("gunicorn ok")
+
+
+def check_gunicorn_without_port(standin: Path) -> None:
+    # L1 execs `gunicorn wsgi:app -b [::]:8000` and does not set PORT.
+    # Use a free port so this check does not depend on 8000 being open.
+    port = free_port()
+    log_path = standin / "gunicorn-noport.log"
+    env = child_env(standin)
+    env.pop("PORT", None)
+    env["WEB_CONCURRENCY"] = "1"
+    proc = spawn(
+        [sys.executable, "-m", "gunicorn", "wsgi:app", "-b", f"[::]:{port}"],
+        env,
+        log_path,
+    )
+    try:
+        wait_ready(proc, port, log_path)
+        status, body, _headers = request(port, "GET", "/api/ping")
+        assert status == 200 and body == b'{"ok": true}', (status, body)
+        stop_and_read(proc, log_path)
+    finally:
+        reap(proc)
+    print("gunicorn without PORT ok")
 
 
 def check_uvicorn(standin: Path) -> None:
@@ -159,6 +191,7 @@ def check_uvicorn(standin: Path) -> None:
         wait_ready(proc, port, log_path)
         check_http(port, "uvicorn")
         check_websocket(port)
+        check_event_loop_not_stalled(port)
         text = stop_and_read(proc, log_path)
     finally:
         reap(proc)
@@ -169,6 +202,89 @@ def check_uvicorn(standin: Path) -> None:
         "sigterm pid=",
     )
     print("uvicorn ok")
+
+
+def check_uvicorn_workers(standin: Path) -> None:
+    port = free_port()
+    log_path = standin / "uvicorn-workers.log"
+    env = child_env(standin)
+    env["PORT"] = str(port)
+    env["WEB_CONCURRENCY"] = "2"
+    proc = spawn(
+        [
+            sys.executable,
+            "-m",
+            "uvicorn",
+            "asgi:app",
+            "--host",
+            "::",
+            "--port",
+            str(port),
+            "--no-access-log",
+            "--log-level",
+            "info",
+        ],
+        env,
+        log_path,
+    )
+    try:
+        # The parent binds the socket before asgi is imported, so this host is ::1.
+        wait_ready(proc, port, log_path, host="::1")
+        wait_for_log(proc, log_path, "lifespan startup pid=", 2)
+        text = stop_and_read(proc, log_path)
+    finally:
+        reap(proc)
+    if text.count("lifespan shutdown pid=") < 2:
+        raise AssertionError(f"expected two lifespan shutdown lines\n{text}")
+    if text.count("sigterm pid=") < 2:
+        raise AssertionError(f"expected two sigterm lines\n{text}")
+    print("uvicorn WEB_CONCURRENCY=2 ok")
+
+
+def check_event_loop_not_stalled(port: int) -> None:
+    errors = []
+    results = {}
+
+    def run(name, func):
+        try:
+            results[name] = func()
+        except Exception as exc:
+            errors.append(exc)
+
+    def slow():
+        started = time.monotonic()
+        status, body, _headers = request(port, "GET", "/api/slow")
+        return time.monotonic() - started, status, body
+
+    def ping():
+        started = time.monotonic()
+        status, body, _headers = request(port, "GET", "/api/ping")
+        return time.monotonic() - started, status, body
+
+    def sse():
+        times, events = read_stream(port, "/api/stream?seconds=1&interval=0.2")
+        return times, events
+
+    slow_thread = threading.Thread(target=run, args=("slow", slow))
+    slow_thread.start()
+    time.sleep(0.1)
+    ping_thread = threading.Thread(target=run, args=("ping", ping))
+    sse_thread = threading.Thread(target=run, args=("sse", sse))
+    ping_thread.start()
+    sse_thread.start()
+    slow_thread.join(timeout=3)
+    ping_thread.join(timeout=3)
+    sse_thread.join(timeout=3)
+    if errors or slow_thread.is_alive() or ping_thread.is_alive() or sse_thread.is_alive():
+        raise AssertionError(errors or "timed out waiting for concurrent requests")
+    slow_s, slow_status, slow_body = results["slow"]
+    ping_s, ping_status, ping_body = results["ping"]
+    times, events = results["sse"]
+    assert slow_status == 200 and slow_body == b'{"slow": true}', slow_body
+    assert slow_s >= 0.5, slow_s
+    assert ping_status == 200 and ping_body == b'{"ok": true}', ping_body
+    assert ping_s < 0.25, ping_s
+    assert events and times[0] < 0.45, times
 
 
 def check_http(port: int, server: str) -> None:
@@ -256,10 +372,10 @@ def check_websocket(port: int) -> None:
         sock.close()
 
 
-def read_stream(port: int) -> tuple:
+def read_stream(port: int, path: str = "/api/stream?seconds=2&interval=0.5") -> tuple:
     conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
     start = time.monotonic()
-    conn.request("GET", "/api/stream?seconds=2&interval=0.5")
+    conn.request("GET", path)
     resp = conn.getresponse()
     try:
         assert resp.status == 200, resp.status
@@ -415,14 +531,14 @@ def spawn(args: list, env: dict, log_path: Path) -> subprocess.Popen:
     return proc
 
 
-def wait_ready(proc: subprocess.Popen, port: int, log_path: Path) -> None:
+def wait_ready(proc: subprocess.Popen, port: int, log_path: Path, host: str = "127.0.0.1") -> None:
     deadline = time.monotonic() + 20
     last = ""
     while time.monotonic() < deadline:
         if proc.poll() is not None:
             raise AssertionError(f"server exited {proc.returncode}\n{log_path.read_text(errors='replace')}")
         try:
-            status, body, _headers = request(port, "GET", "/api/ping")
+            status, body, _headers = request(port, "GET", "/api/ping", host=host)
         except OSError as exc:
             last = str(exc)
             time.sleep(0.05)
@@ -432,6 +548,18 @@ def wait_ready(proc: subprocess.Popen, port: int, log_path: Path) -> None:
         last = f"{status} {body!r}"
         time.sleep(0.05)
     raise AssertionError(f"server did not become ready ({last})\n{log_path.read_text(errors='replace')}")
+
+
+def wait_for_log(proc: subprocess.Popen, log_path: Path, needle: str, count: int) -> None:
+    deadline = time.monotonic() + 20
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            raise AssertionError(f"server exited {proc.returncode}\n{log_path.read_text(errors='replace')}")
+        if log_path.read_text(errors="replace").count(needle) >= count:
+            return
+        time.sleep(0.05)
+    text = log_path.read_text(errors="replace")
+    raise AssertionError(f"expected {count} {needle!r} lines\n{text}")
 
 
 def stop_and_read(proc: subprocess.Popen, log_path: Path) -> str:

@@ -115,6 +115,10 @@ async def _lifespan(receive, send) -> None:
             print(f"lifespan startup pid={os.getpid()}", flush=True)
             await send({"type": "lifespan.startup.complete"})
         elif kind == "lifespan.shutdown":
+            # With --workers, uvicorn installs SIGTERM in the child before this
+            # module can wrap it. Shutdown still runs here, which is the hook
+            # the contract allows for this log line.
+            log_sigterm()
             print(f"lifespan shutdown pid={os.getpid()}", flush=True)
             await send({"type": "lifespan.shutdown.complete"})
             return
@@ -132,7 +136,9 @@ async def _http(scope: dict, receive, send) -> None:
         await _upload(receive, send, headers)
         return
     body = await _json_body(receive, headers, method)
-    status, resp_headers, payload = handle(method, path, headers, body)
+    # handle() is synchronous (Redis, DB, files). Run it off the event loop so
+    # a slow core route cannot stall ping, SSE, or websockets.
+    status, resp_headers, payload = await asyncio.to_thread(handle, method, path, headers, body)
     if not isinstance(payload, (bytes, bytearray)):
         raise TypeError("handle() body must be bytes")
     await _send(send, status, list(resp_headers), bytes(payload))

@@ -49,7 +49,9 @@ def _worker_count(raw: str | None) -> int:
 
 raw_web_concurrency = os.environ.get("WEB_CONCURRENCY")
 workers = _worker_count(raw_web_concurrency)
-bind = f"[::]:{os.environ['PORT']}"
+# app.py listens on 8000 when PORT is unset, then execs gunicorn -b without
+# putting PORT in the environment. The file is loaded before -b is applied.
+bind = f"[::]:{os.environ.get('PORT') or '8000'}"
 graceful_timeout = 30
 # The default silence timeout is 30s, which would kill a 60s event stream.
 timeout = 120
