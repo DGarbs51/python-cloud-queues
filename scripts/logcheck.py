@@ -48,7 +48,8 @@ def capture(path):
 
 def cloud(args):
     start = instant(args.since).replace(microsecond=0)
-    end = datetime.now(timezone.utc).replace(microsecond=0) + timedelta(seconds=args.slack)
+    end = (instant(args.until) if getattr(args, "until", None)
+           else datetime.now(timezone.utc).replace(microsecond=0) + timedelta(seconds=args.slack))
     if start > end:
         raise ValueError("--since is in the future")
     entries, capped, api_orders = [], [], []
@@ -174,6 +175,8 @@ def analyze(entries, marker, fmt, where, burst=None):
     for entry in entries:
         message = str(entry.get("message", ""))
         data = entry.get("data")
+        if isinstance(data, dict) and isinstance(data.get("extra"), dict):
+            data = dict(data["extra"], **{k: v for k, v in data.items() if k != "extra"})
         if isinstance(data, dict) and data.get("marker") == marker:
             # Cloud parses JSON lines: msg/message becomes the entry message, level becomes the
             # entry level, and every other field moves into data.
@@ -384,6 +387,7 @@ def main():
     parser.add_argument("--where", choices=("web", "worker", "both"), default="both")
     parser.add_argument("--burst", type=int)
     parser.add_argument("--slack", type=int, default=10)
+    parser.add_argument("--until", help="ISO end of the collection window (default: now + slack)")
     parser.add_argument("--compare", nargs="*", metavar="RESULT_JSON")
     parser.add_argument("--self-check", action="store_true")
     args = parser.parse_args()
