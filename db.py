@@ -6,12 +6,12 @@ import asyncio
 import os
 import ssl
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from functools import lru_cache
 
 import certifi
 from sqlalchemy import BigInteger, Integer, String, create_engine, delete, select, text
-from sqlalchemy.dialects.mysql import DATETIME
+from sqlalchemy.dialects.mysql import DATETIME, insert
 from sqlalchemy.engine import URL, make_url
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
@@ -28,7 +28,9 @@ class LoadRow(Base):
     run: Mapped[str] = mapped_column(String(32), index=True)
     n: Mapped[int] = mapped_column(Integer)
     payload: Mapped[str] = mapped_column(String(255))
-    created_at: Mapped[datetime] = mapped_column(DATETIME(fsp=6), default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(
+        DATETIME(fsp=6), default=lambda: datetime.now(timezone.utc).replace(tzinfo=None),
+    )
 
 
 def database_url(driver: str) -> URL:
@@ -65,10 +67,12 @@ def sync_session():
     return sessionmaker(sync_engine(), expire_on_commit=False)()
 
 
-def async_engine():
+def async_engine(rows: int):
     # Each job owns its engine, so connections cannot escape to another event loop.
     url = database_url("aiomysql")
-    return create_async_engine(url, **engine_options(url, asynchronous=True))
+    options = engine_options(url, asynchronous=True)
+    options["pool_size"] = min(rows, 5)
+    return create_async_engine(url, **options)
 
 
 def ping() -> None:
@@ -83,26 +87,26 @@ def write_rows(run: str, rows: int) -> None:
 
 def read_rows(rows: int) -> None:
     with sync_session() as session:
-        session.execute(select(LoadRow).limit(rows)).all()
+        session.execute(select(LoadRow).where(LoadRow.id.between(-rows, -1))).all()
 
 
 def query_rows(rows: int) -> None:
     with sync_session() as session:
         for n in range(rows):
-            session.execute(select(LoadRow.id).where(LoadRow.n == n).limit(1)).all()
+            session.execute(select(LoadRow.id).where(LoadRow.id == -(n + 1))).all()
 
 
 async def query_rows_async(rows: int) -> None:
-    engine = async_engine()
+    engine = async_engine(rows)
     try:
         async def query(n: int) -> None:
             async with AsyncSession(engine) as session:
-                await session.execute(select(LoadRow.id).where(LoadRow.n == n).limit(1))
+                await session.execute(select(LoadRow.id).where(LoadRow.id == -(n + 1)))
 
-        # The pool intentionally permits one connection per worker; bound task allocation too.
-        for start in range(0, rows, 10):
+        # Bound both queries and connections to five per async job.
+        for start in range(0, rows, 5):
             results = await asyncio.gather(
-                *(query(n) for n in range(start, min(start + 10, rows))), return_exceptions=True,
+                *(query(n) for n in range(start, min(start + 5, rows))), return_exceptions=True,
             )
             for result in results:
                 if isinstance(result, BaseException):
@@ -116,8 +120,19 @@ def cleanup(run: str) -> None:
         session.execute(delete(LoadRow).where(LoadRow.run == run))
 
 
+def init_schema() -> None:
+    Base.metadata.create_all(sync_engine())
+    # Negative primary keys keep repeatable, indexed read fixtures apart from load writes.
+    statement = insert(LoadRow).values([
+        {"id": -(n + 1), "run": "benchmark", "n": n, "payload": "x" * 255}
+        for n in range(1000)
+    ])
+    with sync_session() as session, session.begin():
+        session.execute(statement.on_duplicate_key_update(id=statement.inserted.id))
+
+
 if __name__ == "__main__":
     if sys.argv[1:] != ["init"]:
         raise SystemExit("usage: python -m db init")
-    Base.metadata.create_all(sync_engine())
+    init_schema()
     print("Database schema ready")

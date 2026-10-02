@@ -113,40 +113,44 @@ TTL = 6 * 60 * 60
 PREFIX = "lcq-load:"
 ACTIVE = PREFIX + "active"
 RUNS = PREFIX + "runs"
-SERVER = "stdlib"
+SERVER = SERVER_NAME = "stdlib"
 MAX_BODY = 64 * 1024
 TERMINAL = {"done", "failed", "expired"}
 HOLD_LOCK = threading.Lock()
 
 
+class ValidationError(ValueError):
+    """Invalid client input, distinct from failures reading internal state."""
+
+
 def run_key(run: str) -> str:
     if not isinstance(run, str) or not re.fullmatch(r"[0-9a-f]{32}", run):
-        raise ValueError("invalid run id")
+        raise ValidationError("invalid run id")
     return PREFIX + "run:" + run
 
 
 def positive_int(value: object, name: str, cap: int) -> int:
     if type(value) is not int or not 1 <= value <= cap:
-        raise ValueError(f"{name} must be an integer from 1 to {cap}")
+        raise ValidationError(f"{name} must be an integer from 1 to {cap}")
     return value
 
 
 def load_options(data: dict) -> dict:
     kind = data.get("kind")
     if not isinstance(kind, str) or kind not in LOAD_JOBS:
-        raise ValueError("unknown load kind")
+        raise ValidationError("unknown load kind")
     result = dict(kind=kind, count=positive_int(data.get("count"), "count", 10000),
                   ms=positive_int(data.get("ms", 100), "ms", 600000 if kind == "mem" else 30000), mb=None, rows=None)
     if kind == "mem":
         result["mb"] = positive_int(data.get("mb"), "mb", 1800)
     elif "mb" in data:
-        raise ValueError("mb is only valid for mem jobs")
+        raise ValidationError("mb is only valid for mem jobs")
     if kind.startswith("db_"):
         result["rows"] = positive_int(data.get("rows", 10), "rows", 1000)
     elif "rows" in data:
-        raise ValueError("rows is only valid for db jobs")
+        raise ValidationError("rows is only valid for db jobs")
     if "key" in data and (not isinstance(data["key"], str) or not 1 <= len(data["key"]) <= 64):
-        raise ValueError("key must be a string of 1 to 64 characters")
+        raise ValidationError("key must be a string of 1 to 64 characters")
     return result
 
 
@@ -192,11 +196,13 @@ def load_record(run: str, queued_at: float | None = None):
     pipe.expire(key + ":attempts", TTL)
     pipe.hsetnx(key + ":jobs", job.uuid, json.dumps(record))
     pipe.expire(key + ":jobs", TTL)
+    pipe.hincrby(key, "revision", 1)
+    pipe.hdel(key, "summary")
     pipe.execute()
     cancelled = bool(store.exists(key + ":cancel")) or store.hget(key, "state") == "expired"
     try:
         yield record, cancelled
-        record["ok"] = True
+        record.update(ok=None if cancelled else True, skipped=cancelled)
     except Exception as exc:
         record.update(ok=False, error=f"{type(exc).__name__}: {exc}"[:200])
         raise
@@ -217,7 +223,11 @@ def save_load_record(key: str, job_uuid: str, record: dict) -> None:
             redis.call('HSET', KEYS[1], ARGV[1], ARGV[2])
         end
         redis.call('EXPIRE', KEYS[1], ARGV[3])
-    """, 1, key + ":jobs", job_uuid, json.dumps(record), TTL)
+        if redis.call('EXISTS', KEYS[2]) == 1 then
+            redis.call('HINCRBY', KEYS[2], 'revision', 1)
+            redis.call('HDEL', KEYS[2], 'summary')
+        end
+    """, 2, key + ":jobs", key, job_uuid, json.dumps(record), TTL)
 
 
 @registry.job(name="load.sync_sleep", tries=1, timeout=90)
@@ -333,7 +343,15 @@ def percentiles(values: list) -> dict:
 
 
 def load_snapshot(run: str) -> dict | None:
+    """Return run metrics; oom_events is best-effort across cgroup/container restarts.
+
+    Failed/lost jobs remain the reliable failure signal during OOM tests.
+    """
     key = run_key(run)
+    summary = telemetry.store.hget(key, "summary")
+    if summary:
+        release_active(run)
+        return json.loads(summary)
     pipe = telemetry.store.pipeline()
     pipe.hgetall(key)
     pipe.hgetall(key + ":accepted")
@@ -353,6 +371,7 @@ def load_snapshot(run: str) -> dict | None:
     timeout = max(config["ms"] / 1000 * 2 + 30, 60)
     lost = [r for r in records if r["finished_at"] is None and now - r["started_at"] > timeout + 60]
     processed = sum(r["ok"] is True for r in finished)
+    skipped = sum(r.get("skipped", False) for r in finished)
     failed = sum(r["ok"] is False for r in finished) + len(lost)
     state = meta["state"]
     error = meta.get("dispatch_error") or ("cancelled" if cancelled else None)
@@ -361,7 +380,7 @@ def load_snapshot(run: str) -> dict | None:
             state, error = "draining", "dispatcher stopped before completion"
         if now >= float(meta["deadline"]):
             state = "expired"
-        elif state == "draining" and processed + failed >= len(accepted):
+        elif state == "draining" and processed + skipped + failed >= len(accepted):
             state = "failed" if failed or error else "done"
         if state != meta["state"]:
             updates = {"state": state, "dispatch_error": error or ""}
@@ -369,9 +388,7 @@ def load_snapshot(run: str) -> dict | None:
                 updates["terminal_at"] = now
                 meta["terminal_at"] = str(now)
             telemetry.store.hset(key, mapping=updates)
-        if state in TERMINAL:
-            release_active(run)
-        else:
+        if state not in TERMINAL:
             telemetry.store.eval("""
                 if redis.call('GET', KEYS[1]) == ARGV[1] then
                     redis.call('EXPIRE', KEYS[1], ARGV[2])
@@ -380,7 +397,7 @@ def load_snapshot(run: str) -> dict | None:
     first = min((float(at) for at in accepted.values()), default=None)
     last = max((r["finished_at"] for r in finished), default=None)
     if state == "expired":
-        failed = len(accepted) - processed
+        failed = len(accepted) - processed - skipped
     end = now
     if state in TERMINAL:
         end = float(meta.get("terminal_at", now)) if lost or state == "expired" else last
@@ -389,13 +406,14 @@ def load_snapshot(run: str) -> dict | None:
     for record in records:
         low, high = oom_by_host.get(record["host"], (record["oom_start"], record["oom_events"]))
         oom_by_host[record["host"]] = (min(low, record["oom_start"]), max(high, record["oom_events"]))
-    return dict(run=run, **config, state=state, dispatched=len(accepted), dispatch_error=error,
-                processed=processed, failed=failed, duplicates=sum(max(0, int(n) - 1) for n in attempts),
+    result = dict(run=run, **config, state=state, dispatched=len(accepted), dispatch_error=error,
+                processed=processed, skipped=skipped, failed=failed, duplicates=sum(max(0, int(n) - 1) for n in attempts),
                 first_queued_at=first, last_finished_at=last, wall_s=round(wall, 3),
                 jobs_per_s=round(processed / wall, 2) if wall else 0,
                 wait_ms=percentiles([max(0, r["started_at"] - float(accepted[uid])) * 1000
                                      for uid, r in jobs.items()]),
-                run_ms=percentiles([(r["finished_at"] - r["started_at"]) * 1000 for r in finished]),
+                run_ms=percentiles([(r["finished_at"] - r["started_at"]) * 1000
+                                    for r in finished if not r.get("skipped")]),
                 workers=dict(Counter(r["worker"] for r in records)),
                 replicas=len({r["host"] for r in records}),
                 python_versions=dict(Counter(r["python"] for r in records)),
@@ -403,6 +421,19 @@ def load_snapshot(run: str) -> dict | None:
                 max_cgroup_mem_mb=max((r["cgroup_mem_mb"] for r in records
                                        if r["cgroup_mem_mb"] is not None), default=None),
                 oom_events=sum(high - low for low, high in oom_by_host.values()))
+    if state in TERMINAL:
+        release_active(run)
+        if config["kind"] == "db_write":
+            import db
+            # Any replica can reconcile an abandoned run; failure leaves it uncached for retry.
+            db.cleanup(run)
+        telemetry.store.eval("""
+            if redis.call('EXISTS', KEYS[1]) == 1 and
+               (redis.call('HGET', KEYS[1], 'revision') or '0') == ARGV[1] then
+                redis.call('HSET', KEYS[1], 'summary', ARGV[2])
+            end
+        """, 1, key, meta.get("revision", "0"), json.dumps(result))
+    return result
 
 
 def dispatch_load(run: str, config: dict) -> None:
@@ -432,6 +463,8 @@ def dispatch_load(run: str, config: dict) -> None:
             pipe.hset(key + ":accepted", receipt.uuid, at)
             pipe.expire(key + ":accepted", TTL)
             pipe.hset(key, mapping={"heartbeat": time.time()})
+            pipe.hincrby(key, "revision", 1)
+            pipe.hdel(key, "summary")
             pipe.execute()
     except Exception as exc:
         logging.exception("Load dispatch failed: %s", run)
@@ -444,11 +477,14 @@ def dispatch_load(run: str, config: dict) -> None:
             if result is None or result["state"] in TERMINAL:
                 break
             time.sleep(1)
-        if config["kind"] == "db_write" and result and result["state"] != "expired":
-            import db
-            db.cleanup(run)
     except Exception:
         logging.exception("Load monitor failed: %s", run)
+
+
+def load_deadline_seconds(config: dict) -> float:
+    # DB budgets scale with query count (5 ms/query), within the six-hour run retention.
+    ms = max(config["ms"], config["rows"] * 5) if config["rows"] is not None else config["ms"]
+    return min(TTL - 60, max(600, config["count"] * ms / 1000 + 120))
 
 
 def start_load(data: dict) -> tuple[int, dict]:
@@ -459,7 +495,7 @@ def start_load(data: dict) -> tuple[int, dict]:
     key = run_key(run)
     now = time.time()
     # Bound abandoned runs even when the web process dies. Admission lasts through that deadline.
-    deadline = now + min(TTL - 60, max(600, config["count"] * config["ms"] / 1000 + 120))
+    deadline = now + load_deadline_seconds(config)
     while True:
         active = store.get(ACTIVE)
         if active:
@@ -580,7 +616,6 @@ def handle(method: str, path: str, headers: Mapping[str, str], body: bytes) -> t
             if path == "/api/env":
                 return json_response(200, runtime_env())
             if path == "/api/load":
-                # ponytail: scan capped run records; cache terminal summaries if polling becomes a bottleneck.
                 runs = [load_snapshot(run) for run in telemetry.store.lrange(RUNS, 0, 19)]
                 return json_response(200, {"runs": [run for run in runs if run is not None]})
             if path.startswith("/api/load/"):
@@ -598,7 +633,11 @@ def handle(method: str, path: str, headers: Mapping[str, str], body: bytes) -> t
                 key = run_key(run)
                 if not telemetry.store.exists(key):
                     return json_response(404, {"error": "run not found"})
-                telemetry.store.set(key + ":cancel", "1", ex=TTL)
+                pipe = telemetry.store.pipeline()
+                pipe.set(key + ":cancel", "1", ex=TTL)
+                pipe.hincrby(key, "revision", 1)
+                pipe.hdel(key, "summary")
+                pipe.execute()
                 return json_response(200, {"ok": True})
             if path == "/api/hold":
                 mb = positive_int(data.get("mb"), "mb", 1800)
@@ -624,7 +663,7 @@ def handle(method: str, path: str, headers: Mapping[str, str], body: bytes) -> t
             if kind in DISPATCHES:
                 return json_response(200, {"uuids": dispatch(kind)})
         return json_response(404, {"error": "not found"})
-    except ValueError as exc:
+    except ValidationError as exc:
         return json_response(400, {"error": str(exc)})
     except Exception:
         logging.exception("Request failed: %s %s", method, path)
@@ -686,7 +725,8 @@ def self_check() -> None:
     assert load_options({"kind": "db_async", "count": 1})["rows"] == 10
     assert load_options({"kind": "mem", "count": 1, "mb": 1, "ms": 600000})["ms"] == 600000
     import db
-    from unittest.mock import patch
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock, patch
     with patch.dict(os.environ, {"DATABASE_URL": "mysql://u%40x:p%3Ass@remote.example/test", "DB_SSL": "0"}):
         url = db.database_url("pymysql")
         assert url.username == "u@x" and url.password == "p:ss"
@@ -694,6 +734,44 @@ def self_check() -> None:
         assert db.database_url("aiomysql").drivername == "mysql+aiomysql"
         assert db.engine_options(url)["connect_args"]["ssl"]["ca"]
         assert db.engine_options(url, asynchronous=True)["connect_args"]["ssl"].check_hostname
+        for rows in (1, 3, 10):
+            with patch.object(db, "create_async_engine") as create:
+                db.async_engine(rows)
+                assert create.call_args.kwargs["pool_size"] == min(rows, 5)
+                assert create.call_args.kwargs["max_overflow"] == 0
+        assert db.engine_options(url)["pool_size"] == 1
+    assert SERVER == SERVER_NAME == "stdlib"
+    assert load_deadline_seconds(load_options({"kind": "db_sync", "count": 10000, "rows": 1000})) == TTL - 60
+    assert load_deadline_seconds(load_options({"kind": "sync", "count": 10000})) == 1120
+    store = MagicMock()
+    run = "a" * 32
+    with patch.dict(telemetry.__dict__, {"store": store}):
+        store.hget.return_value = json.dumps({"run": run, "state": "done"})
+        assert load_snapshot(run)["state"] == "done"
+        store.pipeline.assert_not_called()  # Terminal polling must not fetch full job hashes.
+        store.hget.return_value = "corrupt JSON"
+        with patch.object(logging, "exception"):
+            assert handle("GET", f"/api/load/{run}", {}, b"")[0] == 503
+        store.hget.return_value = "draining"
+        with patch(__name__ + ".current_job", return_value=SimpleNamespace(uuid="job")), \
+                patch(__name__ + ".save_load_record") as save, patch.object(time, "sleep") as sleep:
+            load_sync(run, 1)
+            record = save.call_args.args[2]
+            assert record["ok"] is None and record["skipped"] is True
+            sleep.assert_not_called()
+        store.hget.return_value = None
+        meta = {"config": json.dumps(load_options({"kind": "db_write", "count": 1})),
+                "state": "draining", "heartbeat": str(time.time()), "deadline": str(time.time() + 600)}
+        store.pipeline.return_value.execute.return_value = [meta, {"job": record["queued_at"]},
+                                                            {"job": json.dumps(record)}, ["1"], True]
+        with patch.object(db, "cleanup") as cleanup:
+            result = load_snapshot(run)
+            assert result["skipped"] == 1 and result["processed"] == result["jobs_per_s"] == 0
+            assert result["run_ms"] == {"p50": None, "p95": None, "p99": None}
+            cleanup.assert_called_once_with(run)
+            meta["state"] = "expired"
+            load_snapshot(run)
+            assert cleanup.call_count == 2
     print("Router contract checks passed")
 
 
@@ -701,7 +779,7 @@ if __name__ == "__main__":
     if sys.argv[1:] == ["--self-check"]:
         self_check()
         raise SystemExit(0)
-    SERVER = os.environ.get("SERVER", "stdlib")
+    SERVER = SERVER_NAME = os.environ.get("SERVER", "stdlib")
     port = int(os.environ.get("PORT", "8000"))
     if SERVER == "gunicorn":
         print(f"gunicorn workers={os.environ.get('WEB_CONCURRENCY', '1')}", flush=True)
