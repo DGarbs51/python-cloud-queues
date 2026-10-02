@@ -843,11 +843,13 @@ def self_check() -> None:
         assert db.engine_options(url, asynchronous=True)["connect_args"]["ssl"].check_hostname
         with patch.dict(os.environ, {"DB_SSL_VERIFY": "0"}):
             assert db.engine_options(url)["connect_args"]["ssl"].verify_mode == ssl.CERT_NONE
-        for rows in (1, 3, 10):
+        async def engine_reuse() -> None:
             with patch.object(db, "create_async_engine") as create:
-                db.async_engine(rows)
-                assert create.call_args.kwargs["pool_size"] == min(rows, 5)
+                assert db.async_engine(1) is db.async_engine(10)
+                assert create.call_count == 1
+                assert create.call_args.kwargs["pool_size"] == 5
                 assert create.call_args.kwargs["max_overflow"] == 0
+        asyncio.run(engine_reuse())
         assert db.engine_options(url)["pool_size"] == 1
     assert SERVER == SERVER_NAME == "stdlib"
     assert load_deadline_seconds(load_options({"kind": "db_sync", "count": 10000, "rows": 1000})) == TTL - 60
