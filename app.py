@@ -736,6 +736,20 @@ def finish_logtest(marker, role="", status=""):
     """, 2, PREFIX + "logtest:active", logtest_key(marker), marker, role, status, TTL)
 
 
+def emit_raw_lines(data):
+    """Print caller-supplied lines verbatim, to probe how Cloud classifies raw log lines."""
+    lines = data.get("lines") if isinstance(data, dict) else None
+    if not isinstance(lines, list) or not 1 <= len(lines) <= 50:
+        raise ValidationError("lines must be a list of 1..50 items")
+    for line in lines:
+        if not isinstance(line, dict) or line.get("stream") not in ("stdout", "stderr") \
+                or not isinstance(line.get("text"), str) or len(line["text"]) > 4096 or "\n" in line["text"]:
+            raise ValidationError("each line needs stream stdout|stderr and single-line text <= 4096 chars")
+    for line in lines:
+        print(line["text"], file=sys.stdout if line["stream"] == "stdout" else sys.stderr, flush=True)
+    return {"printed": len(lines)}
+
+
 def emit_logtest(marker, format, burst, role):
     key = logtest_key(marker)
     store = telemetry.store
@@ -983,6 +997,8 @@ def _handle(method: str, path: str, headers: Mapping[str, str], body: bytes) -> 
         elif method == "POST":
             if path == "/api/logtest":
                 return json_response(202, start_logtest(data))
+            if path == "/api/logtest/raw":
+                return json_response(200, emit_raw_lines(data))
             if path == "/api/load":
                 return json_response(*start_load(data))
             if path.startswith("/api/load/") and path.endswith("/cancel"):
