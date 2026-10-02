@@ -23,6 +23,7 @@ from urllib.parse import quote, unquote
 CONTEXT = contextvars.ContextVar("log_context", default={})
 LOGGER = logging.getLogger("cloud_demo")
 LOCK = threading.RLock()
+_SETTINGS_WARNED = False
 FORMATS = ("json", "text", "logfmt")
 CASES = ("levels", "stderr_vs_stdout", "traceback", "exception_group", "unicode", "ansi",
          "long_lines", "embedded_newline", "json_nested", "print_unflushed", "burst",
@@ -35,29 +36,49 @@ def timestamp(at=None):
     return datetime.fromtimestamp(time.time() if at is None else at, timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
+def _settings():
+    defaults = dict(format="json" if "LARAVEL_CLOUD" in os.environ else "text", level="INFO", stream="stdout")
+    choices = dict(format=FORMATS, level=("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"), stream=("stdout", "stderr"))
+    config, invalid = {}, []
+    for key, default in defaults.items():
+        name = "LOG_" + key.upper()
+        value = os.environ.get(name, default)
+        if key == "level":
+            value = value.upper()
+        if value not in choices[key]:
+            invalid.append(name)
+            value = default
+        config[key] = value
+    return config, invalid
+
+
 def settings():
-    fmt = os.environ.get("LOG_FORMAT", "json" if "LARAVEL_CLOUD" in os.environ else "text")
-    level = os.environ.get("LOG_LEVEL", "INFO").upper()
-    stream = os.environ.get("LOG_STREAM", "stdout")
-    if fmt not in FORMATS or level not in ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL") or stream not in ("stdout", "stderr"):
-        raise ValueError("invalid LOG_FORMAT, LOG_LEVEL or LOG_STREAM")
-    return dict(format=fmt, level=level, stream=stream)
+    return _settings()[0]
 
 
-def redact(value):
-    if isinstance(value, dict):
-        return {redact(str(k)): redact(v) for k, v in value.items()}
-    if isinstance(value, (tuple, list)):
-        return [redact(v) for v in value]
-    if not isinstance(value, str):
-        return value
+def secret_values():
     secrets = set()
     for name, secret in os.environ.items():
-        if secret and (name in ("DATABASE_URL", "REDIS_URL") or name.endswith(("_PASSWORD", "_SECRET", "_TOKEN"))):
-            secrets.update((secret, quote(secret, safe=""), unquote(secret)))
-    for secret in sorted(secrets, key=len, reverse=True):
+        if len(secret) >= 6 and (name in ("DATABASE_URL", "REDIS_URL") or name.endswith(("_PASSWORD", "_SECRET", "_TOKEN"))):
+            secrets.update(value for value in (secret, quote(secret, safe=""), unquote(secret)) if len(value) >= 6)
+    return sorted(secrets, key=len, reverse=True)
+
+
+def redact(value, secrets=None):
+    # Scan the environment once per record, including nested fields and object strings.
+    if secrets is None:
+        secrets = secret_values()
+    if isinstance(value, dict):
+        return {redact(str(k), secrets): redact(v, secrets) for k, v in value.items()}
+    if isinstance(value, (tuple, list)):
+        return [redact(v, secrets) for v in value]
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    value = str(value)
+    for secret in secrets:
         value = value.replace(secret, "[REDACTED]")
-    return re.sub(r"(?<![a-zA-Z0-9+.-])([a-zA-Z][a-zA-Z0-9+.-]*://[^\s/@:]*:)[^\s/]*(@)", r"\1[REDACTED]\2", value)
+    # Tolerate unencoded / in userinfo too; the last @ separates password from host.
+    return re.sub(r"(?<![a-zA-Z0-9+.-])([a-zA-Z][a-zA-Z0-9+.-]*://[^\s/@:]*:)[^\s]*(@)", r"\1[REDACTED]\2", value)
 
 
 @contextmanager
@@ -73,19 +94,27 @@ class RedactionFilter(logging.Filter):
     def __init__(self, role):
         super().__init__()
         self.role = role
+        self.static = dict(release=os.environ.get("LARAVEL_CLOUD_COMMIT_SHA", "")[:7],
+                           env=os.environ.get("LARAVEL_CLOUD_ENV_NAME", ""),
+                           host=socket.gethostname(), python=platform.python_version())
 
     def filter(self, record):
-        # Store our own data instead of altering shared LogRecord args/exception state.
-        data = dict(ts=timestamp(record.created), level=record.levelname, logger=record.name,
-                    role=self.role, release=os.environ.get("LARAVEL_CLOUD_COMMIT_SHA", "")[:7],
-                    env=os.environ.get("LARAVEL_CLOUD_ENV_NAME", ""), host=socket.gethostname(),
-                    pid=os.getpid(), python=platform.python_version())
-        data.update(CONTEXT.get())
-        data["extra"] = getattr(record, "fields", {})
-        data["msg"] = record.getMessage()
-        if record.exc_info:
-            data["exc"] = "".join(traceback.format_exception(*record.exc_info))
-        record.safe_data = redact(data)
+        # Filters run outside StreamHandler.emit's error guard. Never let bad log data
+        # interrupt a request/job, or echo the offending args in a diagnostic traceback.
+        try:
+            data = dict(ts=timestamp(record.created), level=record.levelname, logger=record.name,
+                        role=self.role, pid=os.getpid(), **self.static)
+            data.update(CONTEXT.get())
+            fields = getattr(record, "fields", {})
+            data["extra"] = fields if isinstance(fields, dict) else {"fields": fields}
+            data["msg"] = record.getMessage()
+            if record.exc_info:
+                data["exc"] = "".join(traceback.format_exception(*record.exc_info))
+            record.safe_data = redact(data)
+        except Exception as exc:
+            record.safe_data = dict(ts=timestamp(), level="ERROR", logger="cloud_demo",
+                                    role=self.role, pid=os.getpid(), msg="log record formatting failed",
+                                    extra={"error_type": type(exc).__name__})
         return True
 
 
@@ -132,7 +161,8 @@ def handler(role, fmt, stream=None):
 def setup(role: str):
     if role not in ("web", "worker"):
         raise ValueError("role must be web or worker")
-    config = settings()
+    global _SETTINGS_WARNED
+    config, invalid = _settings()
     with LOCK:
         if not LOGGER.handlers:
             LOGGER.addHandler(handler(role, config["format"]))
@@ -144,6 +174,12 @@ def setup(role: str):
                         filt.role = role
         LOGGER.setLevel(config["level"])
         LOGGER.propagate = False
+        if invalid and not _SETTINGS_WARNED:
+            _SETTINGS_WARNED = True
+            # Configuration diagnostics must be visible even with LOG_LEVEL=CRITICAL.
+            LOGGER.handle(LOGGER.makeRecord(LOGGER.name, logging.WARNING, __file__, 0,
+                          "invalid logging settings; using defaults", (), None,
+                          extra={"fields": {"settings": invalid}}))
     return LOGGER
 
 
@@ -251,10 +287,42 @@ def self_check():
         assert redact("mysql://hidden@host/db") == "[REDACTED]"
         assert "password" not in redact("redis://:password@localhost/0")
         assert "p%40ss" not in redact("mysql://user:p%40ss@host/db")
+    class DSN:
+        def __str__(self):
+            return "redis://u:p/w@h"
+
+    with patch.dict(os.environ, {"SHORT_TOKEN": "ab", "DEMO_TOKEN": "sensitive-token"}):
+        assert redact("abacus label") == "abacus label"
+        assert redact("redis://u:p/w@h") == "redis://u:[REDACTED]@h"
+        for fmt in FORMATS:
+            stream = io.StringIO()
+            out = handler("web", fmt, stream)
+            for fields in (None, [DSN()], DSN(), {"nested": [DSN(), "sensitive-token"]}):
+                record = logging.LogRecord("test", logging.INFO, __file__, 1, "safe", (), None)
+                record.fields = fields
+                with patch(__name__ + ".secret_values", wraps=secret_values) as scanned:
+                    out.handle(record)
+                    scanned.assert_called_once()
+            rendered = stream.getvalue()
+            assert "p/w" not in rendered and "sensitive-token" not in rendered
+            assert "log record formatting failed" not in rendered
+            stream.seek(0)
+            stream.truncate(0)
+            out.handle(logging.LogRecord("test", logging.INFO, __file__, 1, "%d", ("bad-argument",), None))
+            assert "log record formatting failed" in stream.getvalue()
+            assert "bad-argument" not in stream.getvalue()
     root_handlers = list(logging.getLogger().handlers)
     setup("web")
     setup("web")
     assert len(LOGGER.handlers) == 1 and not LOGGER.propagate
     assert list(logging.getLogger().handlers) == root_handlers
     assert CONTEXT.get() == {}
+    with patch.dict(os.environ, {"LOG_FORMAT": "bad", "LOG_LEVEL": "warn", "LOG_STREAM": "bad", "LARAVEL_CLOUD": "1"}), \
+            patch(__name__ + "._SETTINGS_WARNED", False), patch.object(LOGGER, "handle") as warning:
+        assert settings() == dict(format="json", level="INFO", stream="stdout")
+        setup("worker")
+        setup("worker")
+        warning.assert_called_once()
+        assert warning.call_args.args[0].levelno == logging.WARNING
+    setup("web")
     print("Logging formatter, redaction, context and idempotency checks passed")

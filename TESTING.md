@@ -397,6 +397,10 @@ The root logger and the queue SDK's own JSON output are untouched. App imports
 configure the registry worker path and all three web entrypoints. `LOG_FORMAT`
 is `json` on Cloud (`LARAVEL_CLOUD` is present), otherwise `text`; `logfmt` is
 also supported. `LOG_LEVEL=INFO` and `LOG_STREAM=stdout` are the defaults.
+Invalid `LOG_*` values fall back individually to these defaults and produce one
+WARNING per process rather than preventing startup. Worker startup omits web
+server/port fields. Malformed logging arguments produce a minimal safe error
+record without throwing into the caller or echoing the offending arguments.
 JSON includes UTC millisecond timestamps, severity, logger, role, release,
 environment, host, PID, Python version, context, structured `extra`, and an
 escaped full traceback in `exc`. Logfmt quotes/escapes values; text deliberately
@@ -430,9 +434,14 @@ L6's owned paths (`wsgi.py`, `asgi.py`, `gunicorn.conf.py`). Launch Uvicorn thro
 `app.py` (which passes `--no-access-log`), or supply that flag yourself to avoid
 its additional access line. This lane does not alter the queue SDK's raw JSON,
 server-native logs or their redaction; the filter applies to every app-owned
-handler. URL userinfo passwords and nonempty `DATABASE_URL`, `REDIS_URL`,
-`*_PASSWORD`, `*_SECRET`, `*_TOKEN` values are redacted in messages, nested
-extras, context and exceptions.
+handler. URL userinfo passwords (including unencoded slashes) and
+`DATABASE_URL`, `REDIS_URL`, `*_PASSWORD`, `*_SECRET`, `*_TOKEN` values of at
+least six characters are redacted in messages, nested extras, context and
+exceptions, including non-JSON objects converted to strings. Short environment
+values are deliberately excluded from substring replacement to avoid corrupting
+ordinary words; short URL passwords are still redacted. Secret variants are
+computed once per record, and host/Python/release/environment metadata once per
+handler. Non-dictionary `fields` are wrapped in a dictionary.
 
 The dashboard's **Logging** panel runs the same experiment as:
 
@@ -446,7 +455,14 @@ BASE_URL=https://your-environment BURST=10 k6 run k6/logs.js
 
 POST accepts `format=json|text|logfmt|all`, `where=web|worker|both`, and integer
 `burst=0..5000` (default 0). It returns 202 before emission, records progress in
-Valkey for six hours, and queues `demo.logtest` for the worker side. GET returns
+Valkey for six hours, and queues `demo.logtest` for the worker side. An atomic
+Redis lease allows only one probe run per environment; concurrent POSTs return
+409 before spawning a thread or dispatching a job. The lease is released after
+both requested roles finish or fail, with an owner check so an old run cannot
+release a newer one. Starter failures cancel queued roles while preserving
+already running work. Stale/duplicate worker deliveries do not emit again.
+The lease expires after six hours and refreshes when an emitter starts, bounding
+orphaned admissions when a process dies. GET returns
 `web`/`worker` states (`not_requested`, `queued`, `running`, `done`, `failed`) and
 `web_emitted`/`worker_emitted` booleans. An interrupted process can leave a queued
 or running state until expiry; clients time out after four minutes and keep the
@@ -474,8 +490,12 @@ python scripts/logcheck.py --compare results/logcheck-local-json.json results/lo
 ```
 
 Collection uses five-second windows, subdividing capped responses down to one
-second. Half-open time bounds avoid duplicate boundary entries without hiding
-actual duplicate records. Cloud returns at most 100 entries (including access
+second. Responses retain inclusive overlap: displayed timestamps may be rounded.
+Across windows, only exact `(loggedAt, type, message)` matches are deduplicated;
+duplicate entries within a single response remain visible. No returned entries
+are discarded based on their displayed boundary second. Transient CLI failures
+and timeouts are retried up to three attempts with 1 s / 2 s backoff. Naive
+platform timestamps are treated as UTC. Cloud returns at most 100 entries (including access
 logs); a capped one-second window cannot be paginated reliably at the API's
 one-second timestamp resolution. The report marks collection incomplete and
 lists those windows: missing lines then cannot establish a collector drop.
@@ -486,11 +506,18 @@ manifests themselves are missing. Local files have no platform timestamp,
 severity or stream attribution, so those measurements remain unknown.
 
 Tables and `results/logcheck-<env>-<format>.json` report records/expected,
-physical entries per record, severity mapping, types, return order, lengths,
+physical entries per record, severity mapping, types, timestamp order, lengths,
 payload hashes, Unicode, ANSI, filtered/control secret visibility, burst counts
 and emission duration, platform delivery span, and timestamp latency (one-second
-resolution). Ordering means API/file return order; the script does not reorder
-entries to make sequences appear correct. A Cloud log view may render ANSI or
+resolution). Sequence checks sort stably by `loggedAt` when timestamps exist,
+retaining API/file order for same-second ties; without timestamps they use file
+order. The original input order and each API window's direction are reported
+separately. Same-second ties cannot prove emission order. For long JSON/logfmt
+records, the report counts bytes and entries without the marker in the same
+second/type buckets. These may be continuation chunks or unrelated traffic;
+missing hashes remain explicitly ambiguous between splitting and truncation.
+They are not silently assigned to a record or claimed as one-line truncation.
+A Cloud log view may render ANSI or
 JSON differently than its API; UI display interpretation still requires visual
 inspection. Findings (including missing/truncated records) exit zero; malformed
 input, failed CLI calls, and other script errors exit nonzero. Results overwrite
@@ -514,7 +541,8 @@ PYTHONUNBUFFERED=1 uv run python -c 'import logs; logs.emit_tests("00000000-0000
 python scripts/logcheck.py --file results/l6-local.log --marker 00000000-0000-0000-0000-000000000006 --where web --burst 10
 ```
 
-The integration check uses real stdlib HTTP and invokes the Gunicorn WSGI and
-Uvicorn ASGI callables; it does not launch those server managers. Full server
+The integration check also races eight admissions against real Redis and checks
+lease ownership, completion, starter/emitter failure, and stale/duplicate jobs.
+It uses real stdlib HTTP and invokes the Gunicorn WSGI and Uvicorn ASGI callables; it does not launch those server managers. Full server
 process/4-queue-worker runs and Cloud collection remain follow-up validation
 under the task's prohibition on spawning workers and running Cloud commands.

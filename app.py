@@ -128,7 +128,7 @@ elif "asgi" in sys.modules:
     SERVER = SERVER_NAME = "uvicorn"
 if not any(arg.startswith("--self-check") for arg in sys.argv) and not (__name__ == "__main__" and SERVER != "stdlib"):
     log.info("startup", extra={"fields": dict(server=SERVER, port=os.environ.get("PORT", "8000"),
-             web_concurrency=os.environ.get("WEB_CONCURRENCY", "1"))})
+             web_concurrency=os.environ.get("WEB_CONCURRENCY", "1")) if LOG_ROLE == "web" else {}})
 MAX_BODY = 64 * 1024
 TERMINAL = {"done", "failed", "expired"}
 HOLD_LOCK = threading.Lock()
@@ -136,6 +136,10 @@ HOLD_LOCK = threading.Lock()
 
 class ValidationError(ValueError):
     """Invalid client input, distinct from failures reading internal state."""
+
+
+class LogtestBusy(Exception):
+    """An environment-wide log probe is still queued or running."""
 
 
 def run_key(run: str) -> str:
@@ -705,20 +709,56 @@ def logtest_status(marker):
                 worker_emitted=result.get("worker") == "done")
 
 
+def finish_logtest(marker, role="", status=""):
+    # A failed starter cancels only queued roles: a worker may already be running.
+    # Completion and owner-checked release are atomic across web/worker processes.
+    telemetry.store.eval("""
+        if redis.call('EXISTS', KEYS[2]) == 1 then
+            if ARGV[2] == '' then
+                for _, role in ipairs({'web', 'worker'}) do
+                    if redis.call('HGET', KEYS[2], role) == 'queued' then
+                        redis.call('HSET', KEYS[2], role, 'failed')
+                    end
+                end
+            else
+                redis.call('HSET', KEYS[2], ARGV[2], ARGV[3])
+            end
+            redis.call('EXPIRE', KEYS[2], ARGV[4])
+        end
+        if redis.call('GET', KEYS[1]) == ARGV[1] then
+            for _, role in ipairs({'web', 'worker'}) do
+                local state = redis.call('HGET', KEYS[2], role)
+                if state == 'queued' or state == 'running' then return 0 end
+            end
+            return redis.call('DEL', KEYS[1])
+        end
+        return 0
+    """, 2, PREFIX + "logtest:active", logtest_key(marker), marker, role, status, TTL)
+
+
 def emit_logtest(marker, format, burst, role):
     key = logtest_key(marker)
     store = telemetry.store
-    store.hset(key, role, "running")
+    # Reject stale queued jobs and refresh the lease before emitting, so a late
+    # worker cannot overlap a newer probe after the original admission expires.
+    started = store.eval("""
+        if redis.call('GET', KEYS[1]) ~= ARGV[1] or redis.call('EXISTS', KEYS[2]) == 0 then return 0 end
+        if redis.call('HGET', KEYS[2], ARGV[2]) ~= 'queued' then return 0 end
+        redis.call('EXPIRE', KEYS[1], ARGV[3])
+        redis.call('HSET', KEYS[2], ARGV[2], 'running')
+        return 1
+    """, 2, PREFIX + "logtest:active", key, marker, role, TTL)
+    if not started:
+        log.warning("logtest stale or duplicate delivery skipped", extra={"fields": dict(marker=marker, role=role)})
+        return
     try:
         logs.emit_tests(marker, format, burst, role)
     except Exception:
-        store.hset(key, role, "failed")
         log.exception("logtest failed", extra={"fields": dict(marker=marker, role=role)})
+        finish_logtest(marker, role, "failed")
         raise
     else:
-        store.hset(key, role, "done")
-    finally:
-        store.expire(key, TTL)
+        finish_logtest(marker, role, "done")
 
 
 @registry.job(name="demo.logtest", tries=1, timeout=180)
@@ -743,23 +783,23 @@ def start_logtest(data):
     marker, emitted_at = str(uuid.uuid4()), logs.timestamp()
     key = logtest_key(marker)
     store = telemetry.store
-    pipe = store.pipeline()
-    pipe.hset(key, mapping=dict(format=format, where=where, burst=burst, emitted_at=emitted_at,
-                               web="queued" if where in ("web", "both") else "not_requested",
-                               worker="queued" if where in ("worker", "both") else "not_requested"))
-    pipe.expire(key, TTL)
-    pipe.execute()
-    starting = "worker" if where in ("worker", "both") else "web"
+    if not store.set(PREFIX + "logtest:active", marker, nx=True, ex=TTL):
+        raise LogtestBusy("logtest already active")
     try:
+        pipe = store.pipeline()
+        pipe.hset(key, mapping=dict(format=format, where=where, burst=burst, emitted_at=emitted_at,
+                                   web="queued" if where in ("web", "both") else "not_requested",
+                                   worker="queued" if where in ("worker", "both") else "not_requested"))
+        pipe.expire(key, TTL)
+        pipe.execute()
         if where in ("worker", "both"):
             receipt = worker_logtest.dispatch(marker, format, burst)
             store.hset(key, "job_uuid", receipt.uuid)
         if where in ("web", "both"):
-            starting = "web"
             threading.Thread(target=contextvars.copy_context().run,
                              args=(emit_logtest, marker, format, burst, "web"), daemon=True).start()
     except Exception:
-        store.hset(key, starting, "failed")
+        finish_logtest(marker)
         raise
     command = shlex.join(["python", "scripts/logcheck.py", "--env", os.environ.get("LARAVEL_CLOUD_ENV_NAME", "local"),
                           "--marker", marker, "--since", emitted_at, "--format", format, "--where", where, "--burst", str(burst)])
@@ -768,8 +808,14 @@ def start_logtest(data):
 
 def self_check_logging():
     import io
+    import subprocess
     from types import SimpleNamespace
     from unittest.mock import MagicMock, patch
+    imported = subprocess.run([sys.executable, "-c", "import sys; sys.argv = ['cli', 'work']; import app"],
+                              cwd=Path(__file__).parent, capture_output=True, text=True, check=True,
+                              env={**os.environ, "LOG_FORMAT": "json", "LOG_LEVEL": "INFO", "LOG_STREAM": "stdout"})
+    startup = next(json.loads(line) for line in imported.stdout.splitlines() if json.loads(line).get("msg") == "startup")
+    assert startup["role"] == "worker" and startup["extra"] == {}
     output = io.StringIO()
     owned = log.handlers[0]
     previous = owned.stream
@@ -846,10 +892,16 @@ def self_check_logging():
             dispatch.assert_called_once_with(result["marker"], "all", 2)
             assert thread.call_args.kwargs["args"][0] is emit_logtest
             assert "--marker" in result["command"]
+            store.set.return_value = False
+            thread.reset_mock()
+            dispatch.reset_mock()
+            assert handle("POST", "/api/logtest", {"Content-Type": "application/json"}, b"{}")[0] == 409
+            thread.assert_not_called()
+            dispatch.assert_not_called()
             with patch.object(logs, "emit_tests") as emit:
                 emit_logtest(result["marker"], "all", 2, "web")
                 emit.assert_called_once_with(result["marker"], "all", 2, "web")
-                assert store.hset.call_args.args[-2:] == ("web", "done")
+                assert store.eval.call_args.args[-3:-1] == ("web", "done")
             with patch(__name__ + ".current_job", return_value=SimpleNamespace(uuid="job", job_name="demo.logtest", attempt=1)), \
                     patch.object(logs, "emit_tests") as emit:
                 worker_logtest(result["marker"], "all", 2)
@@ -968,6 +1020,8 @@ def _handle(method: str, path: str, headers: Mapping[str, str], body: bytes) -> 
             if kind in DISPATCHES:
                 return json_response(200, {"uuids": dispatch(kind)})
         return json_response(404, {"error": "not found"})
+    except LogtestBusy as exc:
+        return json_response(409, {"error": str(exc)})
     except ValidationError as exc:
         return json_response(400, {"error": str(exc)})
     except Exception:
@@ -1038,6 +1092,53 @@ def self_check_logtest():
     with patch.dict(sys.modules, {"app": sys.modules[__name__]}):
         import wsgi
         import asgi
+    def check_admission():
+        from concurrent.futures import ThreadPoolExecutor
+        def submit(_):
+            try:
+                return start_logtest({"where": "worker"})
+            except LogtestBusy:
+                return None
+        with patch.object(worker_logtest, "dispatch", return_value=SimpleNamespace(uuid="local-job")):
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                accepted = [result for result in pool.map(submit, range(8)) if result]
+            assert len(accepted) == 1
+            first = accepted[0]["marker"]
+            active = PREFIX + "logtest:active"
+            assert store.get(active) == first and 0 < store.ttl(active) <= TTL
+            finish_logtest(first, "worker", "done")
+            assert not store.exists(active)
+            second = start_logtest({"where": "worker"})["marker"]
+            finish_logtest(first, "worker", "done")
+            assert store.get(active) == second  # Late completion cannot release a newer lease.
+            with patch.object(logs, "emit_tests") as emit:
+                emit_logtest(first, "all", 0, "worker")
+                emit.assert_not_called()  # Stale queued delivery cannot start a second emitter.
+                emit_logtest(second, "all", 0, "worker")
+                emit_logtest(second, "all", 0, "worker")
+                emit.assert_called_once()
+            assert not store.exists(active)
+            third = start_logtest({"where": "worker"})["marker"]
+            store.hset(logtest_key(third), "web", "running")
+            finish_logtest(third)  # Starter failure must not release an already running role.
+            assert store.get(active) == third
+            assert store.hget(logtest_key(third), "worker") == "failed"
+            finish_logtest(third, "web", "done")
+            assert not store.exists(active)
+            failing = start_logtest({"where": "worker"})["marker"]
+            with patch.object(logs, "emit_tests", side_effect=RuntimeError("probe failure")):
+                try:
+                    emit_logtest(failing, "json", 0, "worker")
+                except RuntimeError:
+                    pass
+            assert store.hget(logtest_key(failing), "worker") == "failed" and not store.exists(active)
+        with patch.object(worker_logtest, "dispatch", side_effect=RuntimeError("dispatch failure")):
+            try:
+                start_logtest({"where": "both"})
+            except RuntimeError:
+                pass
+            assert not store.exists(PREFIX + "logtest:active")
+
     request_headers = {"Content-Type": "application/json", "X-Request-ID": "l6-local-request"}
     body = json.dumps(dict(format="all", where="both", burst=10)).encode()
 
@@ -1077,6 +1178,7 @@ def self_check_logtest():
                 thread.join()
 
     try:
+        check_admission()
         # Capture native stdout/stderr, including the crash subprocess, without re-emitting lines.
         with open("results/l6-integration.log", "w") as output:
             saved = (os.dup(1), os.dup(2))

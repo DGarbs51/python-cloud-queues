@@ -20,7 +20,7 @@ import logs
 def instant(value):
     dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
     if dt.tzinfo is None:
-        raise ValueError("timestamps must include a timezone")
+        dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc)
 
 
@@ -51,7 +51,8 @@ def cloud(args):
     end = datetime.now(timezone.utc).replace(microsecond=0) + timedelta(seconds=args.slack)
     if start > end:
         raise ValueError("--since is in the future")
-    entries, capped = [], []
+    entries, capped, api_orders = [], [], []
+    seen = set()
 
     def window(low, high):
         # Wait through the final slack window; a query with a future --to cannot see future logs.
@@ -59,7 +60,14 @@ def cloud(args):
             time.sleep(min(1, (high - datetime.now(timezone.utc)).total_seconds()))
         command = ["cpx", "cloud", "environment:logs", args.app, args.env,
                    "--from=" + low.isoformat(), "--to=" + high.isoformat(), "--json"]
-        result = subprocess.run(command, capture_output=True, text=True, check=True, timeout=60)
+        for attempt in range(3):
+            try:
+                result = subprocess.run(command, capture_output=True, text=True, check=True, timeout=60)
+                break
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+                if attempt == 2:
+                    raise
+                time.sleep(2 ** attempt)
         batch = json.loads(result.stdout)
         if not isinstance(batch, list) or any(not isinstance(e, dict) or "message" not in e or "loggedAt" not in e for e in batch):
             raise ValueError("unexpected cpx log response (expected an array of log entries)")
@@ -71,14 +79,32 @@ def cloud(args):
             return
         if len(batch) >= 100:
             capped.append(dict(start=low.isoformat(), end=high.isoformat(), entries=len(batch)))
-        # API bounds can be inclusive. Half-open windows avoid overlap without erasing real duplicates.
-        entries.extend(e for e in batch if low <= instant(e["loggedAt"]) < high)
+        api_orders.append(dict(start=low.isoformat(), end=high.isoformat(), order=entry_order(batch)))
+        # Keep inclusive overlap: displayed seconds may be rounded rather than truncated.
+        # Dedupe exact matches across windows, preserving duplicates within one response.
+        fingerprints = [(e["loggedAt"], e.get("type"), e["message"]) for e in batch]
+        entries.extend(e for e, fingerprint in zip(batch, fingerprints) if fingerprint not in seen)
+        seen.update(fingerprints)
 
     while start < end:
         stop = min(start + timedelta(seconds=5), end)
         window(start, stop)
         start = stop
-    return entries, capped
+    entries.sort(key=lambda e: instant(e["loggedAt"]))
+    return entries, capped, api_orders
+
+
+def entry_order(entries):
+    if not entries or any(not e.get("loggedAt") for e in entries):
+        return "unavailable"
+    times = [instant(e["loggedAt"]) for e in entries]
+    if len(set(times)) == 1:
+        return "tied"
+    if times == sorted(times):
+        return "ascending"
+    if times == sorted(times, reverse=True):
+        return "descending"
+    return "mixed"
 
 
 def parse_pairs(text):
@@ -137,11 +163,18 @@ def expected(case, burst):
 
 
 def analyze(entries, marker, fmt, where, burst=None):
+    input_order = entry_order(entries)
+    if input_order != "unavailable":
+        entries = sorted(entries, key=lambda e: instant(e["loggedAt"]))
     groups = defaultdict(list)
     observed = []
+    unattributed = defaultdict(list)
     for entry in entries:
         message = str(entry.get("message", ""))
         if marker not in message:
+            if entry.get("loggedAt"):
+                second = instant(entry["loggedAt"]).replace(microsecond=0)
+                unattributed[(second, entry.get("type"))].append(len(message.encode()))
             continue
         record = parse(message)
         if record.get("marker") != marker or record.get("format") != fmt or "seq" not in record:
@@ -181,6 +214,13 @@ def analyze(entries, marker, fmt, where, burst=None):
                                         observed_bytes=len(item["payload"].encode()) if "payload" in item else None,
                                         sha256_match=hashlib.sha256(item["payload"].encode()).hexdigest() == item.get("sha256") if "payload" in item else False)
                                    for item in items]
+                seconds = {(instant(e["loggedAt"]).replace(microsecond=0), e.get("type"))
+                           for e in physical if e.get("loggedAt")}
+                candidates = [size for key in seconds for size in unattributed[key]]
+                row["unattributed_same_second"] = dict(entries=len(candidates), bytes=sum(candidates)) if seconds else None
+                row["incomplete_payload"] = any(not item["sha256_match"] for item in row["payloads"])
+                if row["incomplete_payload"]:
+                    row["split_vs_truncation"] = "unknown; same-second unmarked entries may include continuations or unrelated logs"
             elif case == "unicode":
                 row["unicode_intact"] = all(item.get("msg") == logs.UNICODE for item in items) if items else None
             elif case == "ansi":
@@ -206,12 +246,13 @@ def analyze(entries, marker, fmt, where, burst=None):
                 values = list(row["stream_metadata"].values())
                 row["streams_distinguishable"] = len(values) == 2 and values[0] != values[1]
             rows.append(row)
-    return dict(format=fmt, marker=marker, rows=rows,
+    return dict(format=fmt, marker=marker, rows=rows, input_order=input_order,
+                order_basis="loggedAt (stable for ties)" if input_order != "unavailable" else "file order",
                 order_by_role={role: [n for r, n in observed if r == role] == sorted(n for r, n in observed if r == role)
                                for role in roles if any(r == role for r, _ in observed)},
-                notes=["Order is API/file return order, not reconstructed emission order; compare within role only.",
+                notes=["Order uses stable loggedAt sorting when available; API order is reported separately. Same-second ties cannot prove delivery order.",
                        "Cloud loggedAt has 1-second resolution; subsecond/negative latency is not conclusive.",
-                       "Text continuations repeat seq; JSON/logfmt entries >1 may mean duplicate delivery.",
+                       "Text continuations repeat seq; unmarked entries in long-line seconds are counted separately, not assigned without proof.",
                        "Missing crash_line can demonstrate buffered print loss. Set PYTHONUNBUFFERED=1.",
                        "Raw sentinel is an intentionally fake control. File mode has no platform level/time/stream metadata."])
 
@@ -220,7 +261,7 @@ def table(report):
     print(f"\n{report['format']}  marker={report['marker']}")
     print(f"{'role / case':30} {'found/expected':15} {'entries/record':17} {'order':7} levels / type / findings")
     for row in report["rows"]:
-        findings = {key: row[key] for key in ("payloads", "unicode_intact", "ansi", "secret_visible", "delivered", "duration_ms", "delivery_span_s", "latency_s", "streams_distinguishable", "pythonunbuffered", "returncode", "delivery_gap_s") if key in row and row[key] is not None}
+        findings = {key: row[key] for key in ("payloads", "unicode_intact", "ansi", "secret_visible", "delivered", "duration_ms", "delivery_span_s", "latency_s", "streams_distinguishable", "pythonunbuffered", "returncode", "delivery_gap_s", "unattributed_same_second", "incomplete_payload", "split_vs_truncation") if key in row and row[key] is not None}
         print(f"{row['role'] + '/' + row['case']:30} {str(row['records']) + '/' + str(row['expected']):15} "
               f"{str(row['entries_per_record']):17} {str(row['order_preserved']):7} "
               + ', '.join(row["level_mapping"]) + ' / ' + ', '.join(row["types"]) + ' / ' + json.dumps(findings, ensure_ascii=False))
@@ -257,23 +298,71 @@ def self_check():
     split = [dict(message=tag + text) for text in ("traceback", "continuation")]
     row = next(r for r in analyze(split, marker, "text", "web")["rows"] if r["case"] == "traceback")
     assert row["records"] == 1 and row["entries"] == 2
+    # Unmarked chunks must not silently disappear from the split/truncation findings.
+    logfmt = logs.pairs(dict(ts="2026-10-01T00:00:01Z", role="web", **{**records[1]["extra"], "format": "logfmt"}))
+    for fmt, whole in (("json", json.dumps(records[1])), ("logfmt", logfmt)):
+        chunks = [dict(message=text, type="system", loggedAt="2026-10-01T00:00:01") for text in (whole[:500], whole[500:])]
+        row = next(r for r in analyze(chunks, marker, fmt, "web")["rows"] if r["case"] == "long_lines")
+        assert row["incomplete_payload"] and row["unattributed_same_second"] == dict(entries=1, bytes=len(whole[500:].encode()))
+        assert "unknown" in row["split_vs_truncation"]
+    assert instant("2026-10-01T00:00:01") == instant("2026-10-01T00:00:01Z")
+    descending = [dict(message=json.dumps(record), type="system", loggedAt=f"2026-10-01T00:00:0{n}Z")
+                  for n, record in enumerate(records)]
+    report = analyze(list(reversed(descending)), marker, "json", "web")
+    assert report["input_order"] == "descending" and report["order_by_role"]["web"]
+
     from types import SimpleNamespace
     from unittest.mock import patch
-    start = datetime.now(timezone.utc).replace(microsecond=0) - timedelta(seconds=5)
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 10, 1, 0, 0, 10, tzinfo=timezone.utc)
+    args = SimpleNamespace(since="2026-10-01T00:00:00Z", slack=0, app="test", env="test")
     calls = []
     def fake_run(command, **kwargs):
         low = instant(next(v.split("=", 1)[1] for v in command if v.startswith("--from=")))
         high = instant(next(v.split("=", 1)[1] for v in command if v.startswith("--to=")))
         calls.append((low, high))
-        batch = [dict(message="probe", loggedAt=low.isoformat()) for _ in range(99)]
-        batch.append(dict(message="boundary", loggedAt=high.isoformat()))
+        # Include shared boundaries newest-first, plus a genuine same-response duplicate.
+        batch = [dict(message="boundary", type="system", loggedAt=high.isoformat()),
+                 dict(message="boundary", type="access", loggedAt=high.isoformat()),
+                 dict(message="different", type="system", loggedAt=high.isoformat()),
+                 dict(message="boundary", type="system", loggedAt=low.isoformat()),
+                 dict(message="boundary", type="system", loggedAt=low.isoformat())]
         return SimpleNamespace(stdout=json.dumps(batch))
-    with patch.object(subprocess, "run", side_effect=fake_run):
-        collected, capped = cloud(SimpleNamespace(since=start.isoformat(), slack=0, app="test", env="test"))
-    assert capped and all((instant(w["end"]) - instant(w["start"])).total_seconds() == 1 for w in capped)
-    assert all(e["message"] != "boundary" for e in collected)
-    assert len(collected) == 99 * len(capped) and len(calls) > len(capped)
-    print("logcheck parsing, splitting, truncation and capped-window checks passed")
+    with patch(__name__ + ".datetime", Clock), patch.object(subprocess, "run", side_effect=fake_run):
+        collected, capped, orders = cloud(args)
+    assert not capped and len(calls) == 2
+    assert len(collected) == 8  # Same-second differences in type/message must survive.
+    assert sum(instant(e["loggedAt"]).second == 5 for e in collected) == 3
+    assert all(window["order"] == "descending" for window in orders)
+    assert entry_order(collected) == "ascending"
+
+    calls.clear()
+    def capped_run(command, **kwargs):
+        result = fake_run(command, **kwargs)
+        batch = json.loads(result.stdout)
+        batch.extend(dict(message=f"probe-{n}", type="system", loggedAt=batch[-1]["loggedAt"]) for n in range(95))
+        return SimpleNamespace(stdout=json.dumps(batch))
+    with patch(__name__ + ".datetime", Clock), patch.object(subprocess, "run", side_effect=capped_run):
+        collected, capped, orders = cloud(args)
+    assert len(capped) == 10 and len(calls) > len(capped)
+    assert all((instant(w["end"]) - instant(w["start"])).total_seconds() == 1 for w in capped)
+
+    success = SimpleNamespace(stdout="[]")
+    transient = [subprocess.TimeoutExpired("cpx", 60), subprocess.CalledProcessError(1, "cpx"), success, success]
+    with patch(__name__ + ".datetime", Clock), patch.object(subprocess, "run", side_effect=transient) as run, \
+            patch.object(time, "sleep") as sleep:
+        assert cloud(args)[0] == []
+        assert run.call_count == 4 and [c.args[0] for c in sleep.call_args_list] == [1, 2]
+    with patch(__name__ + ".datetime", Clock), patch.object(subprocess, "run", side_effect=subprocess.TimeoutExpired("cpx", 60)) as run, \
+            patch.object(time, "sleep"):
+        try:
+            cloud(args)
+            raise AssertionError("exhausted retries must fail")
+        except subprocess.TimeoutExpired:
+            assert run.call_count == 3
+    print("logcheck parsing, truncation/split evidence, overlap, ordering, retries and capped-window checks passed")
 
 
 def main():
@@ -303,12 +392,14 @@ def main():
         parser.error("--marker and either --file or --since are required")
     if not 0 <= args.slack <= 300 or (args.burst is not None and not 0 <= args.burst <= 5000):
         parser.error("slack must be 0..300 and burst 0..5000")
-    entries, capped = (capture(args.file), []) if args.file else cloud(args)
+    entries, capped, api_orders = (capture(args.file), [], []) if args.file else cloud(args)
     for fmt in logs.FORMATS if args.format == "all" else (args.format,):
         report = analyze(entries, args.marker, fmt, args.where, args.burst)
-        report.update(env=args.env, source=args.file or "cloud", capped_windows=capped,
+        report.update(env=args.env, source=args.file or "cloud", capped_windows=capped, api_window_orders=api_orders,
                       collection_complete=not capped, collected_at=logs.timestamp())
         table(report)
+        if api_orders:
+            print("API window order:", dict(Counter(window["order"] for window in api_orders)))
         if capped:
             print(f"WARNING: {len(capped)} one-second windows hit the 100-entry cap; absence is inconclusive.")
         destination = Path("results") / f"logcheck-{args.env}-{fmt}.json"
