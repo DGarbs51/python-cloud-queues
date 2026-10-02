@@ -980,6 +980,10 @@ def _handle(method: str, path: str, headers: Mapping[str, str], body: bytes) -> 
                 return json_response(200, result) if result else json_response(404, {"error": "logtest not found"})
             if path == "/api/ping":
                 return json_response(200, {"ok": True})
+            if path == "/api/headers":
+                # Probe which request-ID headers Cloud injects; values only for ID/trace-like names, never cookies or auth.
+                shown = re.compile(r"request|trace|ray|cloud|forwarded|real-ip", re.I)
+                return json_response(200, {k: (v if shown.search(k) else None) for k, v in headers.items()})
             if path == "/api/stats":
                 return json_response(200, telemetry.snapshot())
             if path == "/api/env":
