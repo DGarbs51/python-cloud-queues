@@ -29,6 +29,7 @@ Classification: platform, CLI, SDK (`laravel-cloud-queues`), app (this repositor
 - Repro (python-3-14): 4 jobs `load.mem` holding 450 MiB for 420 s on 6 warm replicas. At ~02:50Z the autoscaler removed replica `1blzzs` while it was ~4 min into its job. The other 3 jobs finished at ~02:53Z; the 4th was recorded `failed` (lost, never redelivered as processed) by 03:04Z. Worker log on scale-in: `Received SIGTERM; stopping after the current job.`; the pod is then killed after the grace period.
 - Expected: scale-in waits for in-flight background jobs (or documents that the shutdown timeout bounds job duration and applies to scale-in too).
 - Control with graceful shutdown = 600 s (set in the UI on python-3-14, then redeployed): 6 replicas, 24 jobs held 480 s (03:26:05-03:34:05Z). Scale-in began removing Worker replicas at 03:31:13, 03:32:13 and 03:33:13 (`[Deploy: 13] Worker Cluster cluster shut down...`) while the jobs ran; the pods stayed until the jobs finished, and all 24 were processed (0 failed, 0 duplicates). So the setting does govern autoscaler scale-in, contrary to its help text, which mentions only the previous deployment.
+- Redeploy control (python-3-11, default 30 s): 8 jobs of 120 s dispatched at 04:25:14Z, deploy started 04:25:43Z. The 4 in-flight jobs kept running on the old release (host 1x9jk8) while the new release came up; the new release (host 159s6f) started taking the 4 queued jobs at ~04:26:59Z; the old jobs finished at ~04:27:15-29Z, about 25 s after the switch, inside the 30 s window. Result 8/8 processed, 0 duplicates. This confirms the grace period counts from when the new deployment becomes active (old instances are not stopped at deploy start). It does not show a kill at 30 s; the scale-in case above does.
 - Oddity: the workers' `Received SIGTERM; stopping after the current job.` lines are stamped 03:34:05, when the jobs finished, not when the shutdown started (to investigate: delayed signal delivery vs. log timestamping).
 - Impact: any Python job longer than the graceful shutdown timeout (max 600 s) can be killed by scale-in, not just by deploys. Jobs over 10 minutes cannot be protected at all. Scale-in from 6 to 1 replica took ~15 min after load stopped (02:45 -> ~03:00), removing one replica at a time.
 
@@ -83,11 +84,16 @@ Classification: platform, CLI, SDK (`laravel-cloud-queues`), app (this repositor
 - `os.cpu_count()` reports 4 on some pods and 16 on others (8 earlier), always with cgroup `cpu.max 100000 100000` (1 vCPU). `pids.max` is 9241 on some pods and 151738 on others. Python 3.13+ `os.process_cpu_count()` follows the host count too.
 - Impact: pool sizes derived from CPU count differ between deploys of the same code.
 
-### P2. `WEB_CONCURRENCY=3` injected on 1 vCPU (Medium, platform; pending L5 server tests)
+### P2. `WEB_CONCURRENCY=3` injected on 1 vCPU (Low, platform/docs)
 - Repro: `command:run` -> `WEB_CONCURRENCY=3`; cgroup `cpu.max 100000 100000` (1 vCPU). The host reports `nproc=8`.
 - Verified on python-3-12: `SERVER=gunicorn` starts 1 master + 3 sync workers (pids 41-43 answering requests), uvicorn with WEB_CONCURRENCY=3 starts 3 workers; no double counting. But 3 processes on 1 vCPU is only right for I/O-bound apps, and each open SSE stream holds one gunicorn sync worker for its whole duration.
 
 ## Build & deploy
+
+### B3. Scale-to-zero cold start for Python (measured) and the Pro-worker restriction (Low, platform/docs)
+- python-3-13 with App `flex.g-1vcpu-512mb` + scale-to-zero (timeout 1) and Worker cluster `flex.m-1vcpu-1gb`: after ~6.5 min idle, the first `GET /api/ping` took 5.6 s and 7.5 s (two rounds) to first byte vs 0.12 s warm; a job dispatched right after was processed in 2.5 s.
+- Enabling scale-to-zero is refused while any Worker cluster uses a Pro size: `422 "Hibernation cannot be enabled with a Pro CPU configured on your worker clusters."` (yet UI-created dedicated environments report hibernation on, see R2).
+- Not tested: a job enqueued by another producer while the environment sleeps (the cache is not publicly reachable).
 
 ### B2. Failed deploy command leaves the previous release serving (working as intended, recorded)
 - Repro: deployment `depl-a2e1bead...` failed in the deploy command; the site kept serving release a59527d (`/api/stats` 200). Good behavior; noted for the rollback tests.
@@ -111,9 +117,9 @@ Classification: platform, CLI, SDK (`laravel-cloud-queues`), app (this repositor
 ### N3. HTTP ingress capacity (measured)
 - python-3-10, stdlib ThreadingHTTPServer, App 1 replica at start, from a laptop (~95 ms RTT): /api/ping and the static dashboard ramped to 600 req/s with 0 errors, p95 ~110 ms. /api/stats (several Valkey reads per request) failed above ~400-500 req/s: 906 x 504 (the 20 s HTTP timeout), 5810 client-side timeouts/resets, 929 dropped iterations, 1 x 502. The 504 status confirms the "HTTP timeout" setting returns 504 at 20 s.
 
-### N1. nginx proxies Python with a PHP document root and a 20 s read timeout (needs contract check)
-- Evidence: `/etc/nginx/conf.d` `root /var/www/html/public; proxy_read_timeout 20; send_timeout 20;` with upstream `PORT=3000`.
-- To verify with L5 SSE/long-request tests before classifying.
+### N1. nginx proxies Python with a PHP document root; HTTP timeout behavior (Low, platform/docs)
+- Evidence: `/etc/nginx/conf.d` `root /var/www/html/public; proxy_read_timeout 20; send_timeout 20;` with upstream `PORT=3000`; `/healthz-*` is answered by nginx without reaching the app.
+- The 20 s value is the environment's "HTTP timeout" setting (5-60 s, UI only). It is an idle-read timeout: SSE streams with regular events ran 40 s fine; a silent upstream gets 504 at 20 s (N3). A repository `public/` directory is served directly to Python apps (documented only for Django static files).
 
 ## Workers / queues
 
@@ -129,6 +135,13 @@ Classification: platform, CLI, SDK (`laravel-cloud-queues`), app (this repositor
 - Probe results on the pod: allowed MULTI/EXEC, EVAL, SCRIPT LOAD/EVALSHA, SET NX PX, BLPOP, INFO, SCAN, KEYS; denied WATCH, UNWATCH, FUNCTION, CONFIG GET, ACL WHOAMI, CLIENT LIST.
 - Expected: either standard transactional commands work or the restriction is documented (valkey.mdx mentions only rate/size limits).
 - Impact: `redis-py` `pipeline.watch()`, Celery/RQ/Dramatiq features and libraries using check-and-set fail at runtime with a 503-class error, never at deploy. Our `/api/load` admission returned 503 until rewritten as a Lua script.
+
+### W4. Default cache eviction policy can silently drop queued jobs (Medium, platform/docs)
+- The cache created in the UI for python-3-10 reports `maxmemory_policy allkeys-lru` (250 MiB). laravel-cloud-queues stores queued, delayed and reserved jobs in that Valkey; when memory fills, LRU eviction can delete job keys with no error. The CLI cache created with `--eviction-policy=noeviction` (python-3-11) reports `noeviction`.
+- Expected: queue-backing caches default to (or the UI warns to use) `noeviction`, or a separate queue cache is recommended; valkey.mdx discusses eviction policies but Python worker docs do not connect it to queues.
+
+### W3. Valkey limits (measured)
+- Valkey 9.0.0 (reports redis_version 7.2.4), valkey-flex-250mb: maxmemory 250 MiB, maxclients 10000; 14 connections with 1 App + 1 Worker replica (4 processes). Cache created by CLI with `--eviction-policy=noeviction` reports `noeviction` (python-3-11).
 
 ### W2. Laravel MySQL TLS certificate is self-signed (ProxySQL auto-generated), so verified TLS fails (High, platform)
 - Versions: all. Evidence: `openssl s_client -starttls mysql` from a pod shows `CN = ProxySQL_Auto_Generated_Server_Certificate` issued by `CN = ProxySQL_Auto_Generated_CA_Certificate`; verification fails with both `/etc/ssl/certs/ca-certificates.crt` and certifi (`Verify return code: 19`).
@@ -176,7 +189,7 @@ Classification: platform, CLI, SDK (`laravel-cloud-queues`), app (this repositor
 - Impact: errors are not filterable by level; the exception line is separated from its stack.
 
 ## Dashboard / UI
-(pending)
+- Not tested in depth (overnight run was CLI/API/k6 driven). Settings found only in the UI: HTTP timeout and graceful shutdown timeout (R7). The replicaCount metric reported 7 replicas with max 6 (R8).
 
 ## Docs
 Docs PR with a Python best-practices guide: https://github.com/laravel/cloud-docs/pull/360 (open, not merged).
