@@ -31,7 +31,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from laravel_cloud_queues import Job, Registry, RetryPolicy, current_job
-from redis.exceptions import WatchError
+from redis.exceptions import NoScriptError
 from telemetry import (
     BURST_SIZE,
     CHECK_KINDS,
@@ -488,52 +488,83 @@ def load_deadline_seconds(config: dict) -> float:
     return min(TTL - 60, max(600, config["count"] * ms / 1000 + 120))
 
 
+ADMIT_LOAD = """
+-- KEYS: active, new run, recent runs, optional idempotency, optional queue.
+-- ARGV: run id, config JSON, now, deadline, record TTL, run key prefix.
+if KEYS[4] ~= '' then
+    local previous = redis.call('GET', KEYS[4])
+    if previous then
+        local raw = redis.call('HGET', ARGV[6] .. previous, 'config')
+        if raw then
+            local saved, requested = cjson.decode(raw), cjson.decode(ARGV[2])
+            local matches = true
+            for k, v in pairs(saved) do if requested[k] ~= v then matches = false end end
+            for k, v in pairs(requested) do if saved[k] ~= v then matches = false end end
+            if matches then return {'reused', previous} end
+        end
+        return {'idempotency key already used', previous}
+    end
+end
+local active = redis.call('GET', KEYS[1])
+if active then
+    local state = redis.call('HGET', ARGV[6] .. active, 'state')
+    local deadline = tonumber(redis.call('HGET', ARGV[6] .. active, 'deadline'))
+    if not state or state == 'done' or state == 'failed' or state == 'expired' or
+       (deadline and deadline <= tonumber(ARGV[3])) then
+        redis.call('DEL', KEYS[1])
+    else
+        return {'run active', active}
+    end
+end
+if KEYS[5] ~= '' then
+    local depth = redis.call('LLEN', KEYS[5]) +
+                  redis.call('ZCARD', KEYS[5] .. ':delayed') +
+                  redis.call('ZCARD', KEYS[5] .. ':reserved')
+    if depth > 20000 then return {'queue depth exceeds 20000', ''} end
+end
+redis.call('SET', KEYS[1], ARGV[1], 'PXAT', math.ceil(tonumber(ARGV[4]) * 1000))
+redis.call('HSET', KEYS[2], 'config', ARGV[2], 'state', 'dispatching',
+           'heartbeat', ARGV[3], 'deadline', ARGV[4], 'dispatch_error', '')
+redis.call('EXPIRE', KEYS[2], ARGV[5])
+redis.call('LPUSH', KEYS[3], ARGV[1])
+redis.call('LTRIM', KEYS[3], 0, 19)
+redis.call('EXPIRE', KEYS[3], ARGV[5])
+if KEYS[4] ~= '' then redis.call('SET', KEYS[4], ARGV[1], 'EX', ARGV[5]) end
+return {'created', ARGV[1]}
+"""
+
+
+def admit_load(store, keys: list[str], args: list):
+    script = store.register_script(ADMIT_LOAD)
+    try:
+        return script(keys=keys, args=args)
+    except NoScriptError:
+        # A cache miss after redis-py's reload is safe to retry; transport failures are not.
+        return store.eval(ADMIT_LOAD, len(keys), *keys, *args)
+
+
 def start_load(data: dict) -> tuple[int, dict]:
     config = load_options(data)
     store = telemetry.store
     idempotency = PREFIX + "key:" + data["key"] if "key" in data else None
     run = uuid.uuid4().hex
     key = run_key(run)
+    active = store.get(ACTIVE)
+    if active:
+        load_snapshot(active)
+    redis_config = registry.config.redis
+    queue = f"{redis_config.prefix}queues:{redis_config.queue}" if redis_config else ""
     now = time.time()
     # Bound abandoned runs even when the web process dies. Admission lasts through that deadline.
     deadline = now + load_deadline_seconds(config)
-    while True:
-        active = store.get(ACTIVE)
-        if active:
-            load_snapshot(active)
-        with store.pipeline() as pipe:
-            try:
-                pipe.watch(ACTIVE, *([idempotency] if idempotency else []))
-                if idempotency:
-                    previous = pipe.get(idempotency)
-                    if previous:
-                        saved = store.hget(run_key(previous), "config")
-                        if saved and json.loads(saved) == config:
-                            return 202, {"run": previous, "requested": config["count"]}
-                        return 409, {"error": "idempotency key already used", "run": previous}
-                active = pipe.get(ACTIVE)
-                if active:
-                    return 409, {"error": "run active", "run": active}
-                redis_config = registry.config.redis
-                if redis_config:
-                    queue = f"{redis_config.prefix}queues:{redis_config.queue}"
-                    depth = store.llen(queue) + store.zcard(queue + ":delayed") + store.zcard(queue + ":reserved")
-                    if depth > 20000:
-                        return 409, {"error": "queue depth exceeds 20000"}
-                pipe.multi()
-                pipe.set(ACTIVE, run, ex=math.ceil(deadline - now))
-                pipe.hset(key, mapping={"config": json.dumps(config), "state": "dispatching",
-                                       "heartbeat": now, "deadline": deadline, "dispatch_error": ""})
-                pipe.expire(key, TTL)
-                pipe.lpush(RUNS, run)
-                pipe.ltrim(RUNS, 0, 19)
-                pipe.expire(RUNS, TTL)
-                if idempotency:
-                    pipe.set(idempotency, run, ex=TTL)
-                pipe.execute()
-                break
-            except WatchError:
-                continue
+    outcome, value = admit_load(
+        store, [ACTIVE, key, RUNS, idempotency or "", queue],
+        [run, json.dumps(config), now, deadline, TTL, PREFIX + "run:"],
+    )
+    if outcome == "reused":
+        return 202, {"run": value, "requested": config["count"]}
+    if outcome != "created":
+        return 409, {"error": outcome, **({"run": value} if value else {})}
     try:
         threading.Thread(target=dispatch_load, args=(run, config), daemon=True).start()
     except Exception:
@@ -709,6 +740,79 @@ class DualStackServer(ThreadingHTTPServer):
         super().server_bind()
 
 
+def self_check_admission() -> None:
+    """Exercise real Lua in configured Valkey using isolated, temporary keys.
+
+    Run with the local Redis environment: python app.py --self-check-admission.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+    from unittest.mock import patch
+
+    store = telemetry.store
+    namespace = PREFIX + "self-check:" + uuid.uuid4().hex + ":"
+    active, runs, queue = (namespace + name for name in ("active", "runs", "queue"))
+    run_prefix = namespace + "run:"
+    config = load_options({"kind": "sync", "count": 1})
+
+    def submit(idempotency="", settings=None):
+        run = uuid.uuid4().hex
+        now = time.time()
+        return admit_load(store, [active, run_prefix + run, runs, idempotency, queue],
+                          [run, json.dumps(settings or config), now, now + 600, TTL, run_prefix])
+
+    try:
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            results = list(pool.map(lambda _: submit(), range(8)))
+        assert sum(result[0] == "created" for result in results) == 1
+        assert sum(result[0] == "run active" for result in results) == 7
+        run = store.get(active)
+        assert store.llen(runs) == 1
+        assert 0 < store.pttl(active) <= 600000
+        assert abs(time.time() + store.pttl(active) / 1000 - float(store.hget(run_prefix + run, "deadline"))) < 1
+        for state in ("done", "failed", "expired"):
+            store.hset(run_prefix + run, "state", state)
+            outcome, run = submit()
+            assert outcome == "created"
+        store.hset(run_prefix + run, "deadline", time.time() - 1)
+        outcome, run = submit()
+        assert outcome == "created"
+        store.delete(run_prefix + run)
+        assert submit()[0] == "created"  # Orphaned active key must not block admission.
+        store.delete(active)
+        idempotency = namespace + "idempotency"
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            results = list(pool.map(lambda _: submit(idempotency), range(8)))
+        assert sum(result[0] == "created" for result in results) == 1
+        assert sum(result[0] == "reused" for result in results) == 7
+        assert len({result[1] for result in results}) == 1
+        run = store.get(active)
+        store.hset(run_prefix + run, "config", json.dumps(dict(reversed(list(config.items())))))
+        assert submit(idempotency) == ["reused", run]  # Compare values, not JSON key order.
+        assert submit(idempotency, {**config, "count": 2}) == ["idempotency key already used", run]
+        store.hset(run_prefix + run, "state", "done")
+        other = submit()[1]
+        assert submit(idempotency) == ["reused", run] and store.get(active) == other
+        store.delete(active)
+        store.rpush(queue, *(["test"] * 19999))
+        store.zadd(queue + ":delayed", {"delayed": 1})
+        assert submit()[0] == "created"  # Existing cap is strictly greater than 20000.
+        store.delete(active)
+        store.zadd(queue + ":reserved", {"reserved": 1})
+        assert submit() == ["queue depth exceeds 20000", ""]
+        assert not store.exists(active)
+        store.delete(queue, queue + ":delayed", queue + ":reserved")
+        with patch.object(store, "evalsha", side_effect=NoScriptError("forced cache miss")), \
+                patch.object(store, "eval", wraps=store.eval) as fallback:
+            assert submit()[0] == "created"
+            fallback.assert_called_once()
+        assert all(0 < store.ttl(key) <= TTL for key in store.scan_iter(namespace + "*"))
+        print("Valkey Lua admission checks passed (concurrency, idempotency, stale active, depth, TTL, EVAL fallback)")
+    finally:
+        keys = list(store.scan_iter(namespace + "*"))
+        if keys:
+            store.delete(*keys)
+
+
 def self_check() -> None:
     """Run contract checks without services: python app.py --self-check."""
     assert handle("GET", "/api/ping?x=1", {}, b"")[0] == 200
@@ -781,6 +885,9 @@ def self_check() -> None:
 if __name__ == "__main__":
     if sys.argv[1:] == ["--self-check"]:
         self_check()
+        raise SystemExit(0)
+    if sys.argv[1:] == ["--self-check-admission"]:
+        self_check_admission()
         raise SystemExit(0)
     SERVER = SERVER_NAME = os.environ.get("SERVER", "stdlib")
     port = int(os.environ.get("PORT", "8000"))
