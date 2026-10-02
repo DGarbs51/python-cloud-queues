@@ -46,19 +46,26 @@ for the details. In short:
 - `POST /api/hold`: one memory hold per web process.
 - `GET /api/compat`, `POST /api/compat/worker`.
 - Optional server-feature routes: `GET /api/stream` (SSE), `POST /api/upload` (streamed
-  hash), websocket `/ws/echo` (ASGI only).
+  hash of a raw binary body up to 512 MiB), websocket `/ws/echo` (ASGI only).
 
 Behaviour that must survive the port:
 
-- Every POST requires `Content-Type: application/json` and returns 415 otherwise. Frameworks
+- Every POST to the JSON routes (all of the above except `/api/upload`) requires
+  `Content-Type: application/json` and returns 415 otherwise. Frameworks
   that parse forms or accept any type by default need an explicit guard (a FastAPI
   dependency, a Flask `before_request`, a Django decorator or middleware). There is no auth
   and no CSRF token: the JSON content type forces a CORS preflight, and the Cloud edge IP
   allowlist restricts access. In Django, mark these views `csrf_exempt`; the content-type
   guard replaces the token.
 - Validation: integers must be real JSON integers (reject booleans, floats, strings), positive
-  and within the caps; bodies up to 64 KiB; errors are `400 {"error": "..."}`. Do not let a
-  framework coerce `"10"` into an int (Pydantic's lax mode does: use `StrictInt`).
+  and within the caps; JSON bodies up to 64 KiB; errors are `400 {"error": "..."}`. Do not
+  let a framework coerce `"10"` into an int (Pydantic's lax mode does: use `StrictInt`).
+- `/api/upload` is the exception to both rules: it takes any content type (`k6/stream.js`
+  sends `application/octet-stream`), streams the body through a hash without holding it in
+  memory and caps it at 512 MiB. Exempt it from a global content-type guard or body limit.
+  In Flask, read `request.stream` in chunks and keep `MAX_CONTENT_LENGTH` at or above
+  512 MiB; in Django, read `request.read(n)` in chunks, not `request.body`, which buffers the
+  whole body and is capped by `DATA_UPLOAD_MAX_MEMORY_SIZE`.
 - Error bodies are `{"error": "..."}`, not the framework's default (`{"detail": ...}` in
   FastAPI, HTML in Django and Flask). Add an error handler for 404, 405, 415 and 400.
 - Routes have no trailing slash. Make sure the framework does not redirect to add or remove
@@ -112,17 +119,28 @@ whatever the framework.
 
 ## Database
 
-Same env vars (`DB_HOST`, `DB_PORT`, `DB_DATABASE`, `DB_USERNAME`, `DB_PASSWORD`, or
-`DATABASE_URL`), TLS in Cloud and none locally (`DB_SSL=0`), the same `load_rows` table and
-small pools (one connection per engine per process, no overflow): six worker replicas of four
-processes must fit under the cluster's `max_connections`.
+Cloud injects only `DATABASE_URL`, shaped `mysql://user:pass@<cluster>.db.laravel.cloud:3306/py3XX`
+with no query parameters and so no TLS hint. Every port must:
 
-- **FastAPI and Flask:** copy `db.py` (SQLAlchemy 2.x, `pymysql` sync and `aiomysql` async
-  engines) unchanged, including `python -m db init` as the deploy command.
+- read `DATABASE_URL` first, and fall back to `DB_HOST`, `DB_PORT`, `DB_DATABASE`,
+  `DB_USERNAME`, `DB_PASSWORD` only for local development;
+- percent-decode the user and password (Cloud passwords can contain URL-reserved characters);
+- turn on TLS whenever the host is not `localhost` or `127.0.0.1`, verifying against
+  `certifi.where()`, even though the URL does not ask for it; local Herd MySQL runs without TLS;
+- use the same `load_rows` table and small pools (one connection per engine per process, no
+  overflow): six worker replicas of four processes must fit under the cluster's
+  `max_connections`.
+
+- **FastAPI and Flask:** copy `db.py` (SQLAlchemy 2.x) unchanged: it rewrites `mysql://` to
+  `mysql+pymysql://` (sync) and `mysql+aiomysql://` (async) and does the above. Keep
+  `python -m db init` as the deploy command.
 - **Django:** use the Django ORM with a `LoadRow` model and one migration
-  (`python manage.py migrate` as the deploy command). Set `CONN_MAX_AGE` below the server's
-  idle timeout (the SQLAlchemy version recycles at 280 s), `CONN_HEALTH_CHECKS = True`, and
-  `OPTIONS = {"ssl": {"ca": certifi.where()}}` in Cloud. The Django ORM is synchronous in
+  (`python manage.py migrate` as the deploy command). Build `DATABASES["default"]` from
+  `DATABASE_URL` in `settings.py` with `urllib.parse.urlsplit` (`unquote` the user and
+  password, `ENGINE` `django.db.backends.mysql`, `NAME` from the path) or `dj-database-url`;
+  either way add `OPTIONS = {"ssl": {"ca": certifi.where()}}` for remote hosts yourself,
+  since the URL carries no TLS parameters. Set `CONN_MAX_AGE` below the server's idle timeout
+  (the SQLAlchemy version recycles at 280 s) and `CONN_HEALTH_CHECKS = True`. The Django ORM is synchronous in
   practice (its async API runs queries in a thread), so `load.db_async` cannot be a real
   concurrent comparison: either keep SQLAlchemy `aiomysql` for that one job or report it as
   "not comparable" rather than drawing conclusions from it.
@@ -149,14 +167,16 @@ Per Python version (3.10 to 3.14), one environment on its own branch:
 
 1. Create the environment from the repository's `python-3.x` branch (each branch differs
    from `main` only in `.python-version`).
-2. App cluster and Worker cluster: `dedicated.c-1vcpu-2gb`, custom autoscaling, minimum 1,
-   maximum 6, CPU threshold 60%, memory threshold 70%.
+2. App cluster and Worker cluster: `pro.g-1vcpu-2gb` (the API rejects
+   `dedicated.c-1vcpu-2gb` for new instances; this repository's 3.10 and 3.14 environments
+   still run it from before), custom autoscaling, minimum 1, maximum 6, CPU threshold 60%,
+   memory threshold 70%. New instances start with scale-to-zero off.
 3. Worker cluster background process: `laravel-cloud-queues work <target>` with 4
    processes. No `--stop-when-empty`.
 4. Attach a Valkey cache (flex 250 MB); Cloud injects `REDIS_URL`. Set
    `LARAVEL_CLOUD_QUEUES_BACKEND=redis`.
-5. Attach the environment's own schema on the shared MySQL cluster and note the injected
-   variable names.
+5. Attach the environment's own schema on the shared MySQL cluster. Cloud injects
+   `DATABASE_URL` (no `DB_*` variables), which the app parses as in [Database](#database).
 6. Leave the build command empty (Cloud installs from `uv.lock` with uv); set the start
    command from the table above and the deploy command (`python -m db init` or
    `python manage.py migrate`).
@@ -170,7 +190,9 @@ SHA, `/api/env` and Run check), then roll out to the rest.
 - [ ] `telemetry.py`, `compat.py`, `index.html` and `k6/` copied unchanged.
 - [ ] Every route in [Contract to preserve](#contract-to-preserve) answers with the same
       status codes and JSON fields; `/api/env` reports the real server and framework.
-- [ ] POSTs without `Content-Type: application/json` get 415; bad ints get 400 with
+- [ ] `DATABASE_URL` is read first, with percent-decoded credentials and TLS for remote hosts.
+- [ ] POSTs to the JSON routes without `Content-Type: application/json` get 415, while
+      `/api/upload` accepts a 100 MiB `application/octet-stream` body; bad ints get 400 with
       `{"error": ...}`; unknown routes get 404 JSON.
 - [ ] Job names, timeouts and tries match; the worker target resolves
       (`laravel-cloud-queues work <target>` starts and lists the jobs).

@@ -8,10 +8,10 @@
 //   SCENARIO=oom k6 run k6/memory.js           COUNT (2) x 1800 MiB jobs: more than one 2 GiB
 //                                              replica fits. Run it alone, with max replicas 1.
 // EXPECT_SCALE=0 drops the "scaled out" check (for example on a pinned baseline).
-import { check, fail, sleep } from 'k6';
+import { check, sleep } from 'k6';
 import http from 'k6/http';
 import { Gauge } from 'k6/metrics';
-import { BASE_URL, TERMINAL, TREND_STATS, get, int, json, post, summary } from './lib.js';
+import { BASE_URL, TERMINAL, THRESHOLDS, TREND_STATS, abort, completed, get, int, json, post, summary } from './lib.js';
 
 const SCENARIO = __ENV.SCENARIO || 'worker_scale';
 const DEFAULTS = {
@@ -29,8 +29,8 @@ const maxCgroupMem = new Gauge('max_cgroup_mem_mb');
 const oomEvents = new Gauge('oom_events');
 
 export const options = {
-  scenarios: { memory: { executor: 'per-vu-iterations', vus: 1, iterations: 1, maxDuration: `${DEADLINE_S + 60}s` } },
-  thresholds: { checks: ['rate==1'] },
+  scenarios: { memory: { executor: 'per-vu-iterations', vus: 1, iterations: 1, maxDuration: `${DEADLINE_S + 120}s` } },
+  thresholds: THRESHOLDS(),
   summaryTrendStats: TREND_STATS,
 };
 
@@ -47,13 +47,17 @@ export default function () {
   if (SCENARIO === 'app_scale') {
     const seconds = int('HOLD_S', DEFAULTS.seconds);
     const res = post('/api/hold', { mb: int('MB', DEFAULTS.mb), seconds }, { tags: { name: 'POST /api/hold' } });
-    if (!check(res, { 'hold accepted (202)': (r) => r.status === 202 })) fail(`POST /api/hold ${res.status}: ${res.body}`);
+    if (!check(res, { 'hold accepted (202)': (r) => r.status === 202 })) {
+      abort(`POST /api/hold ${res.status}: ${String(res.body).slice(0, 200)}`);
+    }
     holdEnds = started + (seconds + 120) * 1000;
   } else {
     const body = { kind: 'mem', count: int('COUNT', DEFAULTS.count), mb: int('MB', DEFAULTS.mb), ms: int('MS', DEFAULTS.ms) };
     const res = post('/api/load', body, { tags: { name: 'POST /api/load' } });
-    if (!check(res, { 'load accepted (202)': (r) => r.status === 202 })) fail(`POST /api/load ${res.status}: ${res.body}`);
-    run = json(res).run;
+    run = (json(res) || {}).run;
+    if (!check(res, { 'load accepted (202)': (r) => r.status === 202 && typeof run === 'string' && run !== '' })) {
+      abort(`POST /api/load ${res.status}: ${String(res.body).slice(0, 200)}`);
+    }
   }
 
   const apps = new Set();
@@ -84,6 +88,7 @@ export default function () {
   console.log(`app replicas seen: ${[...apps].join(', ')}`);
   if (SCENARIO === 'app_scale') {
     if (EXPECT_SCALE) check(apps, { 'App scaled out (more than 1 replica seen)': (a) => a.size > 1 });
+    completed.add(1);
     return;
   }
   workerReplicas.add(maxWorkers);
@@ -104,6 +109,7 @@ export default function () {
     });
     if (EXPECT_SCALE) check(maxWorkers, { 'Worker scaled out (more than 1 replica ran jobs)': (n) => n > 1 });
   }
+  completed.add(1);
 }
 
 export const handleSummary = summary(`memory-${SCENARIO}`);

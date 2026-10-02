@@ -3,9 +3,9 @@
 // Fails on any probe with status "fail", on fewer than MIN_PROBES probes per side, and on a skip
 // unless the probe needs a newer Python than the one running or is listed in ALLOWED_SKIPS.
 // Probes whose status differs between web and worker are logged and counted.
-import { check, fail, sleep } from 'k6';
+import { check, sleep } from 'k6';
 import { Counter } from 'k6/metrics';
-import { TREND_STATS, get, int, json, post, summary } from './lib.js';
+import { THRESHOLDS, TREND_STATS, abort, completed, get, int, json, post, summary } from './lib.js';
 
 const MIN_PROBES = int('MIN_PROBES', 1);
 const ALLOWED_SKIPS = (__ENV.ALLOWED_SKIPS || '').split(',').filter(Boolean);
@@ -13,7 +13,7 @@ const mismatches = new Counter('web_worker_mismatches');
 
 export const options = {
   scenarios: { compat: { executor: 'per-vu-iterations', vus: 1, iterations: 1, maxDuration: '5m' } },
-  thresholds: { checks: ['rate==1'] },
+  thresholds: THRESHOLDS(),
   summaryTrendStats: TREND_STATS,
 };
 
@@ -39,9 +39,9 @@ function assertProbes(side, probes, python) {
 
 export default function () {
   const env = json(get('/api/env', { tags: { name: 'GET /api/env' } }));
-  if (!env) fail('GET /api/env did not return JSON');
+  if (!env || !env.python) abort('GET /api/env did not return JSON');
   const before = json(get('/api/compat', { tags: { name: 'GET /api/compat' } }));
-  if (!before) fail('GET /api/compat did not return JSON');
+  if (!before) abort('GET /api/compat did not return JSON');
   assertProbes('web', before.web || [], env.python);
 
   const res = post('/api/compat/worker', {}, { tags: { name: 'POST /api/compat/worker' } });
@@ -54,7 +54,9 @@ export default function () {
     after = json(get('/api/compat', { tags: { name: 'GET /api/compat' } })) || after;
     if (after.worker && after.worker_at !== before.worker_at) break;
   }
-  if (!check(after, { 'worker stored fresh probes': (a) => a.worker && a.worker_at !== before.worker_at })) return;
+  if (!check(after, { 'worker stored fresh probes': (a) => a.worker && a.worker_at !== before.worker_at })) {
+    abort('no fresh worker probes');
+  }
   assertProbes('worker', after.worker, env.python);
 
   const web = Object.fromEntries((after.web || []).map((p) => [p.name, p]));
@@ -64,6 +66,7 @@ export default function () {
       console.warn(`web/worker differ: ${p.name}: web ${web[p.name].status} (${web[p.name].detail}), worker ${p.status} (${p.detail})`);
     }
   }
+  completed.add(1);
 }
 
 export const handleSummary = summary('compat');

@@ -9,11 +9,20 @@ script=${1:?usage: k6/run-fleet.sh <script> [k6 args...]}
 shift
 mkdir -p results
 
+# Environments created later got generated hostnames.
+url() {
+  case $1 in
+    11) echo https://python-cloud-queues-python-3-11-iutzvn.laravel-demo.cloud ;;
+    12) echo https://python-cloud-queues-python-3-12-e8ecok.laravel-demo.cloud ;;
+    13) echo https://python-cloud-queues-python-3-13-ehqncb.laravel-demo.cloud ;;
+    *) echo "https://python-cloud-queues-3-$1.laravel-demo.cloud" ;;
+  esac
+}
+
 failed=()
 for v in ${VERSIONS:-10 11 12 13 14}; do
   echo "=== 3.$v: $script ==="
-  BASE_URL="https://python-cloud-queues-3-$v.laravel-demo.cloud" ENV_NAME="3-$v" \
-    k6 run "$@" "k6/$script.js" || failed+=("3.$v")
+  BASE_URL=$(url "$v") ENV_NAME="3-$v" k6 run "$@" "k6/$script.js" || failed+=("3.$v")
 done
 
 if [ ${#failed[@]} -gt 0 ]; then

@@ -11,16 +11,20 @@ The suite runs against five environments of one application, one per Python vers
 | Environment | Branch | URL |
 |---|---|---|
 | `python-3-10` | `python-3.10` | https://python-cloud-queues-3-10.laravel-demo.cloud |
-| `python-3-11` | `python-3.11` | https://python-cloud-queues-3-11.laravel-demo.cloud |
-| `python-3-12` | `python-3.12` | https://python-cloud-queues-3-12.laravel-demo.cloud |
-| `python-3-13` | `python-3.13` | https://python-cloud-queues-3-13.laravel-demo.cloud |
+| `python-3-11` | `python-3.11` | https://python-cloud-queues-python-3-11-iutzvn.laravel-demo.cloud |
+| `python-3-12` | `python-3.12` | https://python-cloud-queues-python-3-12-e8ecok.laravel-demo.cloud |
+| `python-3-13` | `python-3.13` | https://python-cloud-queues-python-3-13-ehqncb.laravel-demo.cloud |
 | `python-3-14` | `python-3.14` | https://python-cloud-queues-3-14.laravel-demo.cloud |
 
-Each environment has an App cluster and a Worker cluster (`dedicated.c-1vcpu-2gb`, custom
-autoscaling 1 to 6 replicas at 60% CPU or 70% memory), the worker running
-`laravel-cloud-queues work app:registry` as 4 processes, a 250 MB Valkey cache and a schema
-on the shared MySQL cluster. The pods have 1 vCPU and 2 GiB (cgroup), nginx in front of the
-app with a 20 s `proxy_read_timeout`.
+Each environment has an App cluster and a Worker cluster with custom autoscaling 1 to 6
+replicas at 60% CPU or 70% memory, the worker running `laravel-cloud-queues work app:registry`
+as 4 processes, a 250 MB Valkey cache and a schema on the shared MySQL cluster (Cloud injects
+`DATABASE_URL` and `REDIS_URL`). Instance sizes differ: 3.10 and 3.14 predate the others and
+run the legacy `dedicated.c-1vcpu-2gb` size with hibernation on; 3.11 to 3.13 run
+`pro.g-1vcpu-2gb` (the API rejects the dedicated size for new instances) with scale-to-zero
+off. Both sizes are 1 vCPU and 2 GiB; compare `/api/env` cgroup limits across them before
+reading version differences into results. nginx sits in front of the app with a 20 s
+`proxy_read_timeout`.
 
 ## Running k6
 
@@ -30,25 +34,28 @@ which does):
 
 ```sh
 mkdir -p results
-BASE_URL=https://python-cloud-queues-3-12.laravel-demo.cloud k6 run k6/queue.js
+BASE_URL=https://python-cloud-queues-3-10.laravel-demo.cloud k6 run k6/queue.js
 k6/run-fleet.sh queue -e KIND=async -e COUNT=1000   # every environment, one at a time
 VERSIONS="12 14" k6/run-fleet.sh compat              # a subset
 ```
 
 Script settings are environment variables (`-e NAME=value` or exported). `ENV_NAME` overrides
-the name used in result files; it defaults to `3-12` style names derived from `BASE_URL`.
+the name used in result files; it defaults to the version in `BASE_URL` (`3-12`), else `local`.
 
 | Script | Test | Settings (defaults) |
 |---|---|---|
-| `k6/http.js` | ingress knee per endpoint (`/api/ping`, `/`, `/api/stats`), run one after another | `RATE` (50 req/s), `DURATION` (120 s per endpoint), `EXECUTOR` (`ramping` from 1 to `RATE`, or `constant`), `ENDPOINTS` (`ping,static,stats`), `P95_MS` (1000), `MAX_VUS` |
+| `k6/http.js` | ingress knee per endpoint (`/api/ping`, `/`, `/api/stats`), run one after another, 40 s apart | `RATE` (50 req/s), `DURATION` (120 s per endpoint), `EXECUTOR` (`ramping` from 1 to `RATE`, or `constant`), `ENDPOINTS` (`ping,static,stats`), `P95_MS` (1000), `MAX_VUS` |
 | `k6/queue.js` | one load run from `POST /api/load` to a terminal state | `KIND` (`sync`), `COUNT` (100), `MS`, `MB`, `ROWS`, `KEY`, `DRAIN_S` (900) |
-| `k6/e2e.js` | dashboard readers during a load run, then one Run check | `READ_RATE` (10), `DURATION` (420), `KIND`, `COUNT` (500), `MS` (50), `DRAIN_S` |
+| `k6/e2e.js` | dashboard readers during a load run, then one Run check | `READ_RATE` (10), `KIND`, `COUNT` (500), `MS` (50), `DRAIN_S` (300), `DURATION` (readers; defaults to the driver's worst case, `DRAIN_S` + 720 s) |
 | `k6/coldstart.js` | first request and first job after hibernation | `WAKE_S` (300), `DRAIN_S` |
 | `k6/memory.js` | memory autoscaling and OOM | `SCENARIO` (`worker_scale`, `app_scale`, `oom`), `COUNT`, `MB`, `MS`, `HOLD_S`, `DEADLINE_S` (1800), `EXPECT_SCALE` |
 | `k6/compat.js` | compatibility probes on web and worker | `MIN_PROBES` (1), `ALLOWED_SKIPS`, `WORKER_S` (180) |
-| `k6/stream.js` | SSE, 100 MB upload and websocket (gunicorn/uvicorn modes) | `TESTS` (`sse,upload,ws`), `STREAM_S` (30), `INTERVAL` (1), `UPLOAD_MB` (100), `WS_IDLE_S` (25) |
+| `k6/stream.js` | SSE event count, 100 MB upload and websocket (gunicorn/uvicorn modes) | `TESTS` (`sse,upload,ws`), `STREAM_S` (30), `INTERVAL` (1), `UPLOAD_MB` (100), `WS_IDLE_S` (25) |
+| `k6/sse.py` | SSE per-event arrival times and buffering (k6 cannot see them): `python3 k6/sse.py` | `BASE_URL`, `STREAM_S` (30), `INTERVAL` (1) |
 
-Every script except `http.js` fails (non-zero exit) when any of its checks fail. `http.js`
+Every script except `http.js` fails (non-zero exit) when any of its checks fail, when a
+request it depends on is rejected (for example a 409 because another run is active) and when
+it does not reach its end (a script error or a timeout). `http.js`
 fails on its latency and error-rate thresholds, which is expected past the knee; read the
 per-endpoint `dropped_iterations` and `status_429`/`status_502`/`status_504` counts.
 
@@ -177,9 +184,16 @@ signal and the `FINDINGS.md` category a failure belongs to.
 
 ### 6. Hibernation cold start
 
-- **Steps:** on `python-3-12` with hibernation on: close every dashboard tab, wait until the
-  environment is asleep (dashboard or `instance:list`), then `k6 run k6/coldstart.js`. Record
-  the min-replica setting alongside the result.
+- **Steps:** on `python-3-12`, which has scale-to-zero off as created:
+  1. Record its current hibernation, scale-to-zero and minimum-replica settings
+     (`instance:list` and the dashboard).
+  2. Turn hibernation (scale-to-zero) on for its App and Worker clusters.
+  3. Close every dashboard tab and wait until both clusters show zero running replicas.
+     Without that confirmation the run measures a warm environment: stop and investigate.
+  4. `k6 run k6/coldstart.js`.
+  5. Restore the settings recorded in step 1.
+
+  Record the settings and the time asleep alongside the result.
 - **Expected:** the first `/api/ping` (a Python route; nginx answers `/healthz-*` without
   waking the app) answers 200 after the wake, with no 502/504; the first job is processed
   once the worker cluster is awake.
@@ -276,15 +290,10 @@ Manual, once per environment unless noted. Record what the platform does, not wh
   and `/api/env` (which reports `server`) under each. Expected: `WEB_CONCURRENCY` worker
   processes, not zero or double; SSE events arrive spread over the stream (not buffered) and
   survive past 20 s or are cut cleanly; a 100 MB upload is hashed correctly; the websocket
-  upgrades and survives 25 s idle (uvicorn only); SIGTERM drains in-flight requests. For
-  per-event arrival times, which k6 cannot see:
-
-  ```sh
-  curl -sN "$BASE_URL/api/stream?seconds=30&interval=1" | python3 -c '
-  import sys, time
-  for line in iter(sys.stdin.readline, ""):
-      if line.strip(): print(f"{time.time():.3f} {line.strip()}", flush=True)'
-  ```
+  upgrades and survives 25 s idle (uvicorn only); SIGTERM drains in-flight requests. k6 sees
+  only the whole SSE response, so run `BASE_URL=... python3 k6/sse.py` as well: it prints each
+  event's arrival time and fails when the first event is late or a gap exceeds three intervals
+  (proxy buffering), or when the stream is cut.
 
   Category: Networking/ingress.
 - **Health vs readiness.** Deploy a release that fails at import, binds the wrong port or
@@ -333,8 +342,9 @@ After the measurement windows:
 
 1. Cancel any active load run (`POST /api/load/<run>/cancel` or the dashboard) and wait for
    the queues to drain (`/api/stats` depth 0).
-2. Scale both clusters of every environment back to one replica and turn hibernation back
-   on (`cpx cloud instance:update`, see `--help` for the flags).
+2. Scale both clusters of every environment back to one replica and restore each
+   environment's hibernation setting as recorded before the tests (on for 3.10 and 3.14 as
+   created, off for 3.11 to 3.13) with `cpx cloud instance:update` (see `--help` for the flags).
 3. Delete the load rows from each schema (`DELETE FROM load_rows`) and resize the MySQL
    cluster down.
 4. Leave the `lcq-load:*` keys to their 6 h TTL; press Reset on the dashboard only when no

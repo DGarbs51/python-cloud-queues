@@ -1,16 +1,29 @@
 // Shared helpers for the k6 suite. Run scripts from the repository root so summaries land in
-// results/: BASE_URL=https://python-cloud-queues-3-12.laravel-demo.cloud k6 run k6/http.js
+// results/: BASE_URL=https://python-cloud-queues-3-10.laravel-demo.cloud k6 run k6/http.js
 import http from 'k6/http';
-import { check, fail, sleep } from 'k6';
+import { check, sleep } from 'k6';
+import exec from 'k6/execution';
+import { Counter } from 'k6/metrics';
 
 export const BASE_URL = (__ENV.BASE_URL || 'http://127.0.0.1:8000').replace(/\/+$/, '');
-const HOST = BASE_URL.replace(/^\w+:\/\//, '').split('/')[0];
-// "3-12" for python-cloud-queues-3-12.laravel-demo.cloud; ENV_NAME overrides.
-export const ENV_NAME =
-  __ENV.ENV_NAME || (HOST.startsWith('python-cloud-queues-') ? HOST.split('.')[0].slice(20) : 'local');
+// "3-12" for any host naming the version (python-cloud-queues-python-3-12-e8ecok....); ENV_NAME overrides.
+const VERSION = BASE_URL.match(/python-cloud-queues-(?:python-)?(3-1\d)/);
+export const ENV_NAME = __ENV.ENV_NAME || (VERSION ? VERSION[1] : 'local');
 
 export const TREND_STATS = ['avg', 'min', 'med', 'p(95)', 'p(99)', 'max'];
+
+// A script exception ends an iteration without failing the test, so every test function adds
+// to `completed` when it reaches its end, and THRESHOLDS(n) requires n completions.
+export const completed = new Counter('completed');
+export const THRESHOLDS = (n = 1) => ({ checks: ['rate==1'], completed: [`count==${n}`] });
 export const TERMINAL = ['done', 'failed', 'expired'];
+
+// Ends the whole test with a failed check and a non-zero exit. fail() would only end the
+// iteration, which leaves a test with no failed checks passing.
+export function abort(message) {
+  check(null, { [`aborted: ${message}`]: () => false });
+  exec.test.abort(message);
+}
 
 export function int(name, fallback) {
   const value = __ENV[name];
@@ -58,7 +71,9 @@ export function poll(run, deadline = 900, interval = 2, onSample = null) {
 export function runLoad(body, deadline, interval = 2) {
   const res = post('/api/load', body, { tags: { name: 'POST /api/load' } });
   const accepted = json(res);
-  if (res.status !== 202 || !accepted) fail(`POST /api/load ${res.status}: ${res.body}`);
+  if (res.status !== 202 || !accepted || typeof accepted.run !== 'string' || !accepted.run) {
+    abort(`POST /api/load ${res.status}: ${String(res.body).slice(0, 200)}`);
+  }
   const started = Date.now();
   const result = poll(accepted.run, deadline, interval);
   if (result.timedOut) post(`/api/load/${accepted.run}/cancel`);

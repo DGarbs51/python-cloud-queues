@@ -4,7 +4,7 @@
 // and KEY (idempotency) are passed through when set. DRAIN_S is the deadline; past it the run
 // is cancelled so it stops holding the environment's single load slot.
 import { Counter, Trend } from 'k6/metrics';
-import { TREND_STATS, checkRun, int, runLoad, summary } from './lib.js';
+import { THRESHOLDS, TREND_STATS, checkRun, completed, int, runLoad, summary } from './lib.js';
 
 const COUNT = int('COUNT', 100);
 const DRAIN_S = int('DRAIN_S', 900);
@@ -16,8 +16,8 @@ const runP95 = new Trend('run_p95');
 const duplicates = new Counter('duplicates');
 
 export const options = {
-  scenarios: { run: { executor: 'per-vu-iterations', vus: 1, iterations: 1, maxDuration: `${DRAIN_S + 60}s` } },
-  thresholds: { checks: ['rate==1'] },
+  scenarios: { run: { executor: 'per-vu-iterations', vus: 1, iterations: 1, maxDuration: `${DRAIN_S + 120}s` } },
+  thresholds: THRESHOLDS(),
   summaryTrendStats: TREND_STATS,
 };
 
@@ -41,6 +41,7 @@ export default function () {
   duplicates.add(run.duplicates || 0); // at-least-once delivery: reported, not failed
   checkRun(result, COUNT);
   console.log(`run ${result.id}: ${JSON.stringify(run)}`);
+  completed.add(1);
 }
 
 export const handleSummary = summary('queue');

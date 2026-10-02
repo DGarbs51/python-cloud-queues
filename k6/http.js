@@ -24,13 +24,15 @@ ENDPOINTS.forEach((name, i) => {
     EXECUTOR === 'constant'
       ? { executor: 'constant-arrival-rate', rate: RATE, duration: `${DURATION}s` }
       : { executor: 'ramping-arrival-rate', startRate: 1, stages: [{ target: RATE, duration: `${DURATION}s` }] };
-  // Endpoints run one after another, with a 10 s gap, so each knee is measured alone.
+  // Endpoints run one after another so each knee is measured alone: a scenario's requests time
+  // out within 30 s and gracefulStop ends it 30 s after its duration, so the next starts 40 s later.
   scenarios[name] = Object.assign(executor, {
     timeUnit: '1s',
     preAllocatedVUs: Math.max(10, RATE),
     // Enough VUs to keep the rate while every request waits out the 20 s proxy timeout.
     maxVUs: int('MAX_VUS', RATE * 25),
-    startTime: `${i * (DURATION + 10)}s`,
+    gracefulStop: '30s',
+    startTime: `${i * (DURATION + 40)}s`,
     exec: 'hit',
     env: { ENDPOINT: name },
   });
