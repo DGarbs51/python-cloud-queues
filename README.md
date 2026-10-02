@@ -81,6 +81,23 @@ A full run takes one to two minutes because of the timeout case. A case still wa
   `REDIS_URL` in other modes, so the dashboard keeps working after a switch to managed queues.
 - **Workers**: worker label, process and Python version for the last minute.
 
+## Load and compatibility tests
+
+The repository is also a QA vehicle for Laravel Cloud's Python runtime. On top of the
+dashboard it serves:
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /api/ping` | cheap route for ingress tests (no Valkey or database) |
+| `GET /api/env` | Python build, cgroup limits, memory, server mode, release |
+| `POST /api/load`, `GET /api/load`, `GET /api/load/<run>`, `POST /api/load/<run>/cancel` | queue load runs: sync, async, CPU, memory and database jobs, with throughput and wait percentiles |
+| `POST /api/hold` | hold memory in the web process, for App memory autoscaling |
+| `GET /api/compat`, `POST /api/compat/worker` | runtime compatibility probes on the web process and a worker |
+
+[TESTING.md](TESTING.md) has the test matrix, the [k6](https://k6.io) scripts in `k6/` and
+how to capture platform metrics. [PORTING.md](PORTING.md) is a guide to porting the app and
+tests to FastAPI, Django and Flask.
+
 ## Run locally
 
 You need Redis or Valkey (Laravel Herd bundles Valkey on `127.0.0.1:6379`) and
@@ -104,3 +121,4 @@ restart loop: `while true; do uv run laravel-cloud-queues work app:registry; don
 - `telemetry.py`: job telemetry, dashboard data and the check. Identical in both demo
   repositories; keep them in sync.
 - `index.html`: the dashboard (Tailwind CSS from the CDN, no build step).
+- `k6/`: load and compatibility test scripts; see [TESTING.md](TESTING.md).
