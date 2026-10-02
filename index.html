@@ -102,6 +102,36 @@
       </div>
     </section>
 
+    <section class="mt-8" aria-labelledby="logging-title">
+      <h2 id="logging-title" class="text-xs font-medium uppercase tracking-wide text-slate-500">Logging</h2>
+      <div class="mt-3 rounded-xl border border-slate-800 bg-slate-900 p-5">
+        <p id="logging-config" class="text-sm text-slate-400">Loading logging settings…</p>
+        <form id="logging-form" class="mt-4 flex flex-wrap items-end gap-3">
+          <label class="text-sm text-slate-400">Format
+            <select id="logging-format" class="mt-1 block rounded-md border border-slate-700 bg-slate-950 px-3 py-2 text-slate-200">
+              <option>all</option><option>json</option><option>text</option><option>logfmt</option>
+            </select>
+          </label>
+          <label class="text-sm text-slate-400">Where
+            <select id="logging-where" class="mt-1 block rounded-md border border-slate-700 bg-slate-950 px-3 py-2 text-slate-200">
+              <option>both</option><option>web</option><option>worker</option>
+            </select>
+          </label>
+          <label class="text-sm text-slate-400">Burst lines per format / process
+            <input id="logging-burst" type="number" min="0" max="5000" step="1" value="0" required class="mt-1 block w-28 rounded-md border border-slate-700 bg-slate-950 px-3 py-2 text-slate-200">
+          </label>
+          <button type="submit" class="rounded-md bg-indigo-600 px-3 py-2 text-sm text-white hover:bg-indigo-500 disabled:opacity-50">Run log test</button>
+        </form>
+        <p id="logging-status" role="status" class="mt-3 text-sm text-slate-300"></p>
+        <div id="logging-result" hidden class="mt-3">
+          <p class="break-all text-sm">Marker: <code id="logging-marker"></code></p>
+          <label for="logging-command" class="mt-2 block text-sm text-slate-400">Run after emission completes to inspect Cloud logs</label>
+          <textarea id="logging-command" readonly rows="3" class="mt-1 w-full rounded-md border border-slate-700 bg-slate-950 p-2 font-mono text-xs"></textarea>
+          <button id="logging-copy" type="button" class="mt-2 rounded-md border border-slate-700 px-3 py-1.5 text-sm hover:bg-slate-800">Copy command</button>
+        </div>
+      </div>
+    </section>
+
     <section class="mt-8" aria-labelledby="runtime-title">
       <h2 id="runtime-title" class="text-xs font-medium uppercase tracking-wide text-slate-500">Runtime</h2>
       <dl id="runtime" class="mt-3 grid grid-cols-1 gap-4 rounded-xl border border-slate-800 bg-slate-900 p-5 text-sm sm:grid-cols-2 lg:grid-cols-4"></dl>
@@ -465,6 +495,7 @@
     async function pollRuntime() {
       try {
         const env = await get("/api/env");
+        $("logging-config").textContent = `LOG_FORMAT=${env.logging?.format ?? "unknown"} · LOG_LEVEL=${env.logging?.level ?? "unknown"} · stream=${env.logging?.stream ?? "unknown"}`;
         $("runtime").replaceChildren(...Object.entries(env).map(([key, value]) => {
           const div = document.createElement("div");
           const dt = document.createElement("dt");
@@ -512,6 +543,37 @@
         } while (workerAt === previous && Date.now() < deadline);
         if (workerAt === previous) $("compat-status").textContent = "Still waiting for a worker; try refreshing later.";
       } catch (err) { $("compat-status").textContent = String(err); }
+      finally { button.disabled = false; }
+    });
+
+    $("logging-copy").addEventListener("click", async () => {
+      const command = $("logging-command");
+      try { await navigator.clipboard.writeText(command.value); $("logging-status").textContent = "Command copied."; }
+      catch { command.focus(); command.select(); $("logging-status").textContent = "Command selected; copy it with your keyboard."; }
+    });
+    $("logging-form").addEventListener("submit", async event => {
+      event.preventDefault();
+      const button = event.currentTarget.querySelector('button[type="submit"]');
+      button.disabled = true;
+      const where = $("logging-where").value;
+      try {
+        const run = await post("/api/logtest", {format: $("logging-format").value, where, burst: Number($("logging-burst").value)});
+        $("logging-marker").textContent = run.marker;
+        $("logging-command").value = run.command;
+        $("logging-result").hidden = false;
+        const deadline = Date.now() + 240000;
+        while (Date.now() < deadline) {
+          const state = await get(`/api/logtest/${run.marker}`);
+          $("logging-status").textContent = `Web: ${state.web} · Worker: ${state.worker}`;
+          if (state.web === "failed" || state.worker === "failed") throw new Error("Log emission failed; inspect application logs.");
+          if ((where === "worker" || state.web_emitted) && (where === "web" || state.worker_emitted)) {
+            $("logging-status").textContent += " · Ready to collect logs.";
+            return;
+          }
+          await new Promise(resolve => setTimeout(resolve, 2000));
+        }
+        $("logging-status").textContent += " · Still waiting; keep the marker and collect logs later.";
+      } catch (err) { $("logging-status").textContent = String(err); }
       finally { button.disabled = false; }
     });
 
