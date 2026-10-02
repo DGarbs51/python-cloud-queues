@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 import ssl
+import weakref
 import sys
 from datetime import datetime, timezone
 from functools import lru_cache
@@ -72,12 +73,20 @@ def sync_session():
     return sessionmaker(sync_engine(), expire_on_commit=False)()
 
 
+_async_engines: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, object]" = weakref.WeakKeyDictionary()
+
+
 def async_engine(rows: int):
-    # Each job owns its engine, so connections cannot escape to another event loop.
-    url = database_url("aiomysql")
-    options = engine_options(url, asynchronous=True)
-    options["pool_size"] = min(rows, 5)
-    return create_async_engine(url, **options)
+    # One pooled engine per event loop: the worker keeps a single loop alive, so async jobs
+    # reuse warm TLS connections like the sync engine does, and no connection crosses loops.
+    loop = asyncio.get_running_loop()
+    engine = _async_engines.get(loop)
+    if engine is None:
+        url = database_url("aiomysql")
+        options = engine_options(url, asynchronous=True)
+        options["pool_size"] = 5
+        engine = _async_engines[loop] = create_async_engine(url, **options)
+    return engine
 
 
 def ping() -> None:
@@ -103,21 +112,18 @@ def query_rows(rows: int) -> None:
 
 async def query_rows_async(rows: int) -> None:
     engine = async_engine(rows)
-    try:
-        async def query(n: int) -> None:
-            async with AsyncSession(engine) as session:
-                await session.execute(select(LoadRow.id).where(LoadRow.id == -(n + 1)))
+    async def query(n: int) -> None:
+        async with AsyncSession(engine) as session:
+            await session.execute(select(LoadRow.id).where(LoadRow.id == -(n + 1)))
 
-        # Bound both queries and connections to five per async job.
-        for start in range(0, rows, 5):
-            results = await asyncio.gather(
-                *(query(n) for n in range(start, min(start + 5, rows))), return_exceptions=True,
-            )
-            for result in results:
-                if isinstance(result, BaseException):
-                    raise result
-    finally:
-        await engine.dispose()
+    # Bound both queries and connections to five per async job.
+    for start in range(0, rows, 5):
+        results = await asyncio.gather(
+            *(query(n) for n in range(start, min(start + 5, rows))), return_exceptions=True,
+        )
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
 
 
 def cleanup(run: str) -> None:
