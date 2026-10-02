@@ -69,6 +69,8 @@ def cloud(args):
                     raise
                 time.sleep(2 ** attempt)
         batch = json.loads(result.stdout)
+        if isinstance(batch, dict) and isinstance(batch.get("logs"), list):
+            batch = batch["logs"]  # an empty window comes back as {"logs": []} instead of []
         if not isinstance(batch, list) or any(not isinstance(e, dict) or "message" not in e or "loggedAt" not in e for e in batch):
             raise ValueError("unexpected cpx log response (expected an array of log entries)")
         seconds = int((high - low).total_seconds())
@@ -171,12 +173,18 @@ def analyze(entries, marker, fmt, where, burst=None):
     unattributed = defaultdict(list)
     for entry in entries:
         message = str(entry.get("message", ""))
-        if marker not in message:
+        data = entry.get("data")
+        if isinstance(data, dict) and data.get("marker") == marker:
+            # Cloud parses JSON lines: msg/message becomes the entry message, level becomes the
+            # entry level, and every other field moves into data.
+            record = dict(data, msg=message, platform_parsed=True)
+        elif marker not in message:
             if entry.get("loggedAt"):
                 second = instant(entry["loggedAt"]).replace(microsecond=0)
                 unattributed[(second, entry.get("type"))].append(len(message.encode()))
             continue
-        record = parse(message)
+        else:
+            record = parse(message)
         if record.get("marker") != marker or record.get("format") != fmt or "seq" not in record:
             continue
         role = record.get("role", "unknown")
