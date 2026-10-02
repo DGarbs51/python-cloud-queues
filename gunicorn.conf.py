@@ -13,6 +13,11 @@ import socket
 
 import gunicorn.sock
 
+if os.environ.get("LOG_CONFIG") == "sample":
+    from cloud_logging import configure
+    logconfig_dict = configure()
+    accesslog = "-"
+
 # The stdlib server listens on :: with IPv4 mapped in. gunicorn leaves the
 # kernel default, which is v6-only on macOS, so set the flag before bind.
 _orig_set_options = gunicorn.sock.TCPSocket.set_options
