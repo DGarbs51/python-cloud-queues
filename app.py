@@ -252,8 +252,10 @@ def load_cpu(run: str, ms: int, queued_at: float | None = None) -> None:
     positive_int(ms, "ms", 30000)
     with load_record(run, queued_at) as (_, cancelled):
         if not cancelled:
-            until = time.monotonic() + ms / 1000
-            while time.monotonic() < until:
+            # Spend ms of CPU time, not wall time: under cgroup throttling a wall-clock
+            # spin finishes on schedule and hides the CPU limit.
+            until = time.process_time() + ms / 1000
+            while time.process_time() < until:
                 pass
 
 
