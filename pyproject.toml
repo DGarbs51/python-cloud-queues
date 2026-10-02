@@ -3,7 +3,15 @@ name = "python-cloud-queues"
 version = "0.0.0"
 description = "Plain-Python demo of laravel-cloud-queues from PyPI: a queue telemetry dashboard on the Redis backend."
 requires-python = ">=3.10"
-dependencies = ["laravel-cloud-queues[redis]>=0.1.1"]
+dependencies = [
+    "laravel-cloud-queues[redis]>=0.1.1",
+    "sqlalchemy[asyncio]>=2",
+    "pymysql",
+    "aiomysql",
+    "certifi",
+    "gunicorn",
+    "uvicorn",
+]
 
 [tool.uv]
 package = false
