@@ -49,6 +49,82 @@
       </div>
     </section>
 
+    <section class="mt-8" aria-labelledby="load-title">
+      <h2 id="load-title" class="text-xs font-medium uppercase tracking-wide text-slate-500">Load tests</h2>
+      <div class="mt-3 rounded-xl border border-slate-800 bg-slate-900 p-5">
+        <p class="text-sm text-slate-400">One load run per environment. Pairs run sequentially. Memory and OOM presets put real pressure on the selected cluster.</p>
+        <div id="presets" class="mt-4 flex flex-wrap gap-2"></div>
+        <form id="load-form" class="mt-5 flex flex-wrap items-end gap-3">
+          <label class="text-sm text-slate-400">Kind
+            <select id="load-kind" class="mt-1 block rounded-md border border-slate-700 bg-slate-950 px-3 py-2 text-slate-200">
+              <option value="sync">Sync sleep</option><option value="async">Async sleep</option>
+              <option value="cpu">CPU</option><option value="mem">Worker memory</option>
+              <option value="db_write">DB write</option><option value="db_read">DB read</option>
+              <option value="db_async">DB async</option><option value="db_sync">DB sync</option>
+              <option value="hold">App memory hold</option>
+            </select>
+          </label>
+          <label id="count-field" class="text-sm text-slate-400">Jobs
+            <input id="load-count" type="number" required min="1" max="10000" step="1" value="200" class="mt-1 block w-24 rounded-md border border-slate-700 bg-slate-950 px-3 py-2 text-slate-200">
+          </label>
+          <label id="ms-field" class="text-sm text-slate-400">Milliseconds / job
+            <input id="load-ms" type="number" required min="1" max="30000" step="1" value="100" class="mt-1 block w-32 rounded-md border border-slate-700 bg-slate-950 px-3 py-2 text-slate-200">
+          </label>
+          <label id="mb-field" hidden class="text-sm text-slate-400">Memory (MiB)
+            <input id="load-mb" type="number" required min="1" max="1800" step="1" value="300" class="mt-1 block w-28 rounded-md border border-slate-700 bg-slate-950 px-3 py-2 text-slate-200">
+          </label>
+          <label id="rows-field" hidden class="text-sm text-slate-400">Rows / queries
+            <input id="load-rows" type="number" required min="1" max="1000" step="1" value="10" class="mt-1 block w-28 rounded-md border border-slate-700 bg-slate-950 px-3 py-2 text-slate-200">
+          </label>
+          <label id="seconds-field" hidden class="text-sm text-slate-400">Seconds
+            <input id="load-seconds" type="number" required min="1" max="600" step="1" value="5" class="mt-1 block w-24 rounded-md border border-slate-700 bg-slate-950 px-3 py-2 text-slate-200">
+          </label>
+          <button type="submit" class="rounded-md bg-indigo-600 px-3 py-2 text-sm font-medium text-white hover:bg-indigo-500 disabled:opacity-50">Start custom run</button>
+        </form>
+        <p id="load-flash" role="status" class="mt-3 min-h-5 text-sm text-slate-300"></p>
+        <p class="mt-1 text-xs text-slate-500">Cancel stops dispatch and makes queued jobs no-op; work already running finishes. Holds are per web process and free memory automatically.</p>
+        <p class="mt-1 text-xs text-slate-500">DB async uses up to 5 connections per job (20 across 4 workers), disposed after each job. DB sync uses 1 connection per worker. Read tests use 1000 fixed, indexed benchmark rows.</p>
+        <p class="mt-1 text-xs text-slate-500">OOM events are best-effort: cgroup counters can reset after a restart. Failed jobs, including lost jobs, are the reliable failure signal during OOM tests.</p>
+      </div>
+      <div class="mt-3 overflow-x-auto rounded-xl border border-slate-800">
+        <table class="w-full whitespace-nowrap text-left text-sm">
+          <caption class="sr-only">Latest twenty load runs, updated every second</caption>
+          <thead class="bg-slate-900 text-slate-400"><tr>
+            <th class="px-4 py-2 font-medium">Run / kind</th><th class="px-4 py-2 font-medium">State</th>
+            <th class="px-4 py-2 font-medium">Processed / skipped / sent / requested</th><th class="px-4 py-2 font-medium">Jobs/s</th>
+            <th class="px-4 py-2 font-medium">Wall (s)</th><th class="px-4 py-2 font-medium">Wait p50 / p95 (ms)</th>
+            <th class="px-4 py-2 font-medium">Max RSS / cgroup (MiB)</th><th class="px-4 py-2 font-medium">Workers / replicas</th>
+            <th class="px-4 py-2 font-medium">Failed / duplicates / OOM (best-effort)</th><th class="px-4 py-2 font-medium">Action</th>
+          </tr></thead>
+          <tbody id="load-runs" class="divide-y divide-slate-800"></tbody>
+        </table>
+        <p id="load-empty" class="px-4 py-6 text-center text-sm text-slate-500">No load runs yet.</p>
+      </div>
+    </section>
+
+    <section class="mt-8" aria-labelledby="runtime-title">
+      <h2 id="runtime-title" class="text-xs font-medium uppercase tracking-wide text-slate-500">Runtime</h2>
+      <dl id="runtime" class="mt-3 grid grid-cols-1 gap-4 rounded-xl border border-slate-800 bg-slate-900 p-5 text-sm sm:grid-cols-2 lg:grid-cols-4"></dl>
+      <p id="runtime-error" role="status" class="mt-2 text-sm text-slate-400"></p>
+    </section>
+
+    <section class="mt-8" aria-labelledby="compat-title">
+      <div class="flex flex-wrap items-center justify-between gap-3">
+        <h2 id="compat-title" class="text-xs font-medium uppercase tracking-wide text-slate-500">Runtime compatibility</h2>
+        <button id="compat-run" class="rounded-md border border-slate-700 px-3 py-1.5 text-sm text-slate-300 hover:bg-slate-800 disabled:opacity-50">Run worker probes</button>
+      </div>
+      <p id="compat-status" role="status" class="mt-2 text-sm text-slate-400"></p>
+      <div class="mt-3 overflow-x-auto rounded-xl border border-slate-800">
+        <table class="w-full text-left text-sm">
+          <thead class="bg-slate-900 text-slate-400"><tr>
+            <th class="px-4 py-2 font-medium">Probe / minimum Python</th>
+            <th class="px-4 py-2 font-medium">Web</th><th class="px-4 py-2 font-medium">Worker</th>
+          </tr></thead>
+          <tbody id="compat-probes" class="divide-y divide-slate-800"></tbody>
+        </table>
+      </div>
+    </section>
+
     <section id="depth-section" class="mt-8">
       <h2 class="text-xs font-medium uppercase tracking-wide text-slate-500">Queue depth</h2>
       <div class="mt-3 grid grid-cols-1 gap-4 sm:grid-cols-3">
@@ -247,10 +323,11 @@
       setTimeout(poll, 1000);
     }
 
-    async function post(path) {
-      const res = await fetch(path, { method: "POST", headers: { "Content-Type": "application/json" } });
-      if (!res.ok) throw new Error(`${path} returned ${res.status}`);
-      return res.json();
+    async function post(path, data) {
+      const res = await fetch(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: data === undefined ? undefined : JSON.stringify(data) });
+      const result = await res.json();
+      if (!res.ok) throw new Error(result.error ?? `${path} returned ${res.status}`);
+      return result;
     }
 
     document.addEventListener("click", async (ev) => {
@@ -272,6 +349,175 @@
       }
     });
 
+    const PRESETS = [
+      ["Queue throughput · 1000 × 100 ms", [{kind: "sync", count: 1000, ms: 100}]],
+      ["Async vs sync · 200 × 100 ms", [{kind: "async", count: 200, ms: 100}, {kind: "sync", count: 200, ms: 100}]],
+      ["CPU · 200 × 200 ms", [{kind: "cpu", count: 200, ms: 200}]],
+      ["Worker memory · 1500 MiB / 300 s", [{kind: "mem", count: 1, mb: 1500, ms: 300000}]],
+      ["App hold · 1500 MiB / 300 s", [{kind: "hold", mb: 1500, seconds: 300}]],
+      ["OOM · 4 × 1500 MiB / 300 s", [{kind: "mem", count: 4, mb: 1500, ms: 300000}]],
+      ["DB async vs sync · 200 × 10 queries", [{kind: "db_async", count: 200, rows: 10}, {kind: "db_sync", count: 200, rows: 10}]],
+      ["DB write · 1000 × 10 rows", [{kind: "db_write", count: 1000, rows: 10}]],
+    ];
+    let pairBusy = false;
+    let workerAt = null;
+    const terminal = (r) => ["done", "failed", "expired"].includes(r.state);
+    const number = (n) => n == null ? "—" : n.toLocaleString(undefined, {maximumFractionDigits: 2});
+
+    async function get(path) {
+      const res = await fetch(path);
+      if (!res.ok) throw new Error(`${path} returned ${res.status}`);
+      return res.json();
+    }
+
+    async function startRuns(configs) {
+      if (pairBusy) throw new Error("A preset pair is still running in this browser");
+      pairBusy = true;
+      try {
+        for (let i = 0; i < configs.length; i++) {
+          const config = configs[i];
+          const result = await post(config.kind === "hold" ? "/api/hold" : "/api/load", config);
+          $("load-flash").textContent = config.kind === "hold"
+            ? `Hold ${result.hold.slice(0, 8)} accepted; memory releases after ${config.seconds} seconds.`
+            : `${config.kind} run ${result.run.slice(0, 8)} accepted (${i + 1}/${configs.length}).`;
+          if (i < configs.length - 1) {
+            let run;
+            do {
+              await new Promise(resolve => setTimeout(resolve, 1000));
+              run = await get(`/api/load/${result.run}`);
+            } while (!terminal(run));
+            if (run.state !== "done") throw new Error(`Pair stopped: first run ${run.state}`);
+          }
+        }
+      } finally { pairBusy = false; }
+    }
+
+    PRESETS.forEach(([label, configs], index) => {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "rounded-md px-3 py-2 text-sm font-medium text-white disabled:opacity-50 " +
+        (index === 5 ? "bg-rose-700 hover:bg-rose-600" : "bg-slate-700 hover:bg-slate-600");
+      button.textContent = label;
+      button.addEventListener("click", async () => {
+        button.disabled = true;
+        try { await startRuns(configs); }
+        catch (err) { $("load-flash").textContent = String(err); }
+        finally { button.disabled = false; }
+      });
+      $("presets").append(button);
+    });
+
+    function formFields() {
+      const kind = $("load-kind").value;
+      const enabled = {count: kind !== "hold", ms: kind !== "hold" && !kind.startsWith("db_"),
+        mb: ["mem", "hold"].includes(kind), rows: kind.startsWith("db_"), seconds: kind === "hold"};
+      for (const [name, show] of Object.entries(enabled)) {
+        $(`${name}-field`).hidden = !show;
+        $(`load-${name}`).disabled = !show;
+      }
+      $("load-ms").max = kind === "mem" ? 600000 : 30000;
+    }
+    $("load-kind").addEventListener("change", formFields);
+    formFields();
+    $("load-form").addEventListener("submit", async (ev) => {
+      ev.preventDefault();
+      const data = {kind: $("load-kind").value};
+      for (const name of ["count", "ms", "mb", "rows", "seconds"]) {
+        if (!$(`load-${name}`).disabled) data[name] = Number($(`load-${name}`).value);
+      }
+      try { await startRuns([data]); }
+      catch (err) { $("load-flash").textContent = String(err); }
+    });
+
+    async function pollLoads() {
+      try {
+        const {runs} = await get("/api/load");
+        $("load-empty").hidden = runs.length > 0;
+        $("load-runs").replaceChildren(...runs.map(r => {
+          const tr = document.createElement("tr");
+          const state = cell(r.state, r.state === "done" ? "text-emerald-300" : "text-slate-300");
+          if (r.dispatch_error) state.append(document.createTextNode(`: ${r.dispatch_error}`));
+          tr.append(cell(`${r.run.slice(0, 8)} · ${r.kind}`, "font-mono"), state,
+            cell(`${r.processed} / ${r.skipped ?? 0} / ${r.dispatched} / ${r.count}`), cell(number(r.jobs_per_s)), cell(number(r.wall_s)),
+            cell(`${number(r.wait_ms.p50)} / ${number(r.wait_ms.p95)}`),
+            cell(`${number(r.max_rss_mb)} / ${number(r.max_cgroup_mem_mb)}`),
+            cell(`${Object.keys(r.workers).length} / ${r.replicas}`), cell(`${r.failed} / ${r.duplicates} / ${r.oom_events}`));
+          const action = cell("");
+          if (!terminal(r)) {
+            const button = document.createElement("button");
+            button.textContent = "Cancel";
+            button.setAttribute("aria-label", `Cancel run ${r.run.slice(0, 8)}`);
+            button.className = "rounded border border-slate-700 px-2 py-1 hover:bg-slate-800";
+            button.onclick = async () => {
+              button.disabled = true;
+              try { await post(`/api/load/${r.run}/cancel`); $("load-flash").textContent = `Cancellation requested for ${r.run.slice(0, 8)}`; }
+              catch (err) { $("load-flash").textContent = String(err); button.disabled = false; }
+            };
+            action.append(button);
+          }
+          tr.append(action);
+          return tr;
+        }));
+      } catch (err) { $("load-flash").textContent = String(err); }
+      setTimeout(pollLoads, 1000);
+    }
+
+    async function pollRuntime() {
+      try {
+        const env = await get("/api/env");
+        $("runtime").replaceChildren(...Object.entries(env).map(([key, value]) => {
+          const div = document.createElement("div");
+          const dt = document.createElement("dt");
+          dt.className = "text-xs text-slate-500";
+          dt.textContent = key.replaceAll("_", " ");
+          const dd = document.createElement("dd");
+          dd.className = "mt-1 break-all font-mono text-slate-300";
+          dd.textContent = value == null ? "unavailable" : typeof value === "object" ? JSON.stringify(value) : String(value);
+          div.append(dt, dd);
+          return div;
+        }));
+        $("runtime-error").textContent = "";
+      } catch (err) { $("runtime-error").textContent = String(err); }
+      setTimeout(pollRuntime, 10000);
+    }
+
+    async function refreshCompat() {
+      const result = await get("/api/compat");
+      workerAt = result.worker_at;
+      const key = p => `${p.group}: ${p.name}`;
+      const web = new Map(result.web.map(p => [key(p), p]));
+      const worker = new Map((result.worker ?? []).map(p => [key(p), p]));
+      $("compat-probes").replaceChildren(...Array.from(new Set([...web.keys(), ...worker.keys()])).map(name => {
+        const tr = document.createElement("tr");
+        const probe = web.get(name) ?? worker.get(name);
+        tr.append(cell(`${name} / ${probe.min_python}`, "font-mono"));
+        for (const p of [web.get(name), worker.get(name)]) {
+          tr.append(cell(p ? `${p.status}: ${p.detail}` : "not run", p?.status === "fail" ? "text-rose-300" : p?.status === "pass" ? "text-emerald-300" : "text-slate-400"));
+        }
+        return tr;
+      }));
+      $("compat-status").textContent = workerAt ? `Worker probes: ${new Date(workerAt * 1000).toLocaleString()}` : "Worker probes have not run yet.";
+    }
+    $("compat-run").addEventListener("click", async () => {
+      const button = $("compat-run");
+      button.disabled = true;
+      const previous = workerAt;
+      try {
+        await post("/api/compat/worker");
+        $("compat-status").textContent = "Worker probes queued…";
+        const deadline = Date.now() + 180000;
+        do {
+          await new Promise(resolve => setTimeout(resolve, 5000));
+          await refreshCompat();
+        } while (workerAt === previous && Date.now() < deadline);
+        if (workerAt === previous) $("compat-status").textContent = "Still waiting for a worker; try refreshing later.";
+      } catch (err) { $("compat-status").textContent = String(err); }
+      finally { button.disabled = false; }
+    });
+
+    pollLoads();
+    pollRuntime();
+    refreshCompat().catch(err => { $("compat-status").textContent = String(err); });
     poll();
   </script>
 </body>
