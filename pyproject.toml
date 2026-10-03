@@ -5,9 +5,7 @@ description = "Plain-Python demo of laravel-cloud-queues from PyPI: a queue tele
 requires-python = ">=3.10"
 dependencies = [
     "laravel-cloud-queues[redis]>=0.1.1",
-    "sqlalchemy[asyncio]>=2",
     "pymysql",
-    "aiomysql",
     "certifi",
     "gunicorn",
     "uvicorn",
