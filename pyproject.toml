@@ -1,16 +1,16 @@
 [project]
 name = "python-cloud-queues"
 version = "0.0.0"
-description = "Plain-Python demo of laravel-cloud-queues from PyPI: a queue telemetry dashboard on the Redis backend."
+description = "Plain-Python app that checks whether Python works on a Laravel Cloud deployment."
 requires-python = ">=3.10"
 dependencies = [
-    "laravel-cloud-queues[redis]>=0.1.1",
-    "sqlalchemy[asyncio]>=2",
+    "laravel-cloud-queues[redis]>=0.2.1",
     "pymysql",
-    "aiomysql",
     "certifi",
     "gunicorn",
     "uvicorn",
+    "laravel-cloud-logging>=0.2.1",
+    "psycopg[binary]>=3.3.6",
 ]
 
 [tool.uv]
