@@ -7,6 +7,7 @@ import http.client
 from laravel_cloud_logging import wsgi_middleware
 
 import app as app_module
+import checks
 
 app_module.started("gunicorn")
 
@@ -33,6 +34,8 @@ def app(environ: dict, start_response):
             headers["Content-Type"] = environ["CONTENT_TYPE"]
         if body is None:
             body = environ["wsgi.input"].read(length) if length else b""
+        # The address nginx connected from: ::1 over IPv6, 127.0.0.1 over IPv4.
+        checks.PEER.set(environ.get("REMOTE_ADDR", ""))
         status, headers, body = app_module.handle(environ.get("REQUEST_METHOD", "GET"), path, headers, body)
     start_response(f"{status} {http.client.responses.get(status, 'Error')}", headers)
     return [body]
