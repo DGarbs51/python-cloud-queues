@@ -208,7 +208,9 @@
           return;
         }
 
-        say("Queue check running… this can take one to two minutes.");
+        say(start.status === 409
+          ? "A queue check ran in the last few minutes (one runs at most every 4 minutes). Showing that one."
+          : "Queue check running… this can take one to two minutes.");
         const deadline = Date.now() + 5 * 60 * 1000;
         let check = null;
         while (Date.now() < deadline) {

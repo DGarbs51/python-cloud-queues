@@ -2,7 +2,7 @@
 
 Each check is a small function returning (status, detail, help); CHECKS lists them in display order.
 run() never raises: a check that throws becomes a fail row, every detail is scrubbed of credentials,
-and the checks run in parallel threads so the whole call stays well under 15 s.
+and the checks run in parallel daemon threads under a 12 s deadline.
 """
 
 from __future__ import annotations
@@ -16,8 +16,8 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor, wait
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
@@ -378,18 +378,47 @@ def _one(entry, headers) -> dict[str, str]:
 
 
 DEADLINE = 12  # seconds for the whole list; a check still running then is reported, not awaited
+# Checks still running (possibly hung) from any request. A hung check keeps its one thread; later
+# requests report it instead of starting another, so stuck threads can't pile up.
+_running: set[str] = set()
+_running_lock = threading.Lock()
+
+
+def _record(entry, headers, results: dict) -> None:
+    try:
+        results[entry[1]] = _one(entry, headers)
+    finally:
+        with _running_lock:
+            _running.discard(entry[1])
 
 
 def run(headers) -> dict:
-    pool = ThreadPoolExecutor(len(CHECKS))
-    # Copy the context per check: worker threads must see LOOP_SECONDS set by asgi.py.
-    futures = [pool.submit(contextvars.copy_context().run, _one, entry, headers) for entry in CHECKS]
-    wait(futures, timeout=DEADLINE)
-    pool.shutdown(wait=False)  # a hung check keeps its thread; the response doesn't wait for it
-    rows = [future.result() if future.done() else
-            {"id": entry[1], "label": entry[2], "status": "fail", "detail": f"no answer within {DEADLINE} s",
-             "help": "This check hung. The service it talks to accepted the connection but stopped responding."}
-            for entry, future in zip(CHECKS, futures)]
+    results: dict[str, dict] = {}
+    threads, busy = [], set()
+    for entry in CHECKS:
+        with _running_lock:
+            if entry[1] in _running:
+                busy.add(entry[1])
+                continue
+            _running.add(entry[1])
+        # Copy the context per check: threads must see LOOP_SECONDS set by asgi.py. Daemon threads are
+        # never joined at exit, so a hung probe can't block shutdown.
+        thread = threading.Thread(target=contextvars.copy_context().run, args=(_record, entry, headers, results), daemon=True)
+        thread.start()
+        threads.append(thread)
+    deadline = time.monotonic() + DEADLINE
+    for thread in threads:
+        thread.join(max(0, deadline - time.monotonic()))
+    rows = []
+    for _, id, label, _fn in CHECKS:
+        if id in results:
+            rows.append(results[id])
+        elif id in busy:
+            rows.append({"id": id, "label": label, "status": "warn", "detail": "an earlier run of this check has not finished yet",
+                         "help": "This check was still running from a previous request. If it stays like this, the service it talks to has stopped responding."})
+        else:
+            rows.append({"id": id, "label": label, "status": "fail", "detail": f"no answer within {DEADLINE} s",
+                         "help": "This check hung. The service it talks to accepted the connection but stopped responding."})
     groups: dict[str, list] = {}
     for entry, row in zip(CHECKS, rows):
         groups.setdefault(entry[0], []).append(row)

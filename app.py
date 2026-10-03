@@ -107,12 +107,13 @@ CHECK_LOCK = "lcq-demo:check-lock"
 
 
 def run_check() -> bool:
-    """Start the queue check unless one is already running anywhere (its timeout case restarts workers)."""
+    """Start the queue check at most once per CHECK_DEADLINE across every web process and replica.
+
+    Its timeout case restarts a worker, so repeated starts would keep workers cycling. Within the
+    cooldown the page just shows the latest check.
+    """
     if not telemetry.store.set(CHECK_LOCK, "1", nx=True, ex=CHECK_DEADLINE):
-        evaluated = telemetry.evaluate()
-        if evaluated is None or evaluated["status"] == "running":
-            return False
-        telemetry.store.set(CHECK_LOCK, "1", ex=CHECK_DEADLINE)  # previous check finished early
+        return False
     telemetry.save_check({kind: dispatch(kind) for kind in CHECK_KINDS})
     return True
 

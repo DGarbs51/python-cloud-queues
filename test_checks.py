@@ -98,8 +98,17 @@ def main() -> None:
         started = time.monotonic()
         hung = {r["id"]: r for r in offline_run({}, DATABASE_URL="mysql://u@127.0.0.1:1/db")}
         assert time.monotonic() - started < 3
+        # While it is still stuck, the next request reports it instead of starting another probe.
+        before = threading.active_count()
+        again = {r["id"]: r for r in offline_run({}, DATABASE_URL="mysql://u@127.0.0.1:1/db")}
+        assert again["services.database"]["status"] == "warn", again["services.database"]
+        assert threading.active_count() <= before
     release.set()
     assert hung["services.database"]["status"] == "fail" and "no answer" in hung["services.database"]["detail"]
+    deadline = time.monotonic() + 5
+    while "services.database" in checks._running and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert "services.database" not in checks._running
 
     # Listening port: read from /proc on Linux, judged on [::] vs IPv4-only.
     with patch.dict(os.environ, PORT="8000"), patch.object(checks.Path, "is_file", return_value=True):

@@ -87,7 +87,10 @@ def _dispatch(run: str, count: int) -> None:
             tick.dispatch(run, time.time())
     except Exception as exc:
         _log.exception("throughput dispatch failed", extra=dict(run=run))
-        _telemetry.store.hset(PREFIX + run, "error", str(exc)[:200])
+        pipe = _telemetry.store.pipeline()
+        pipe.hset(PREFIX + run, "error", str(exc)[:200])
+        pipe.expire(PREFIX + run, TTL, nx=True)  # never leave a TTL-less hash behind
+        pipe.execute()
 
 
 def start(data: dict) -> tuple[int, dict]:
@@ -140,7 +143,10 @@ def status(run: str) -> tuple[int, dict]:
     if failed:
         body["error"] = raw["error"]
     # First finisher freezes the result so later polls (and late jobs) cannot change it.
-    if not store.hsetnx(PREFIX + run, "result", json.dumps(body)):
+    pipe = store.pipeline()
+    pipe.hsetnx(PREFIX + run, "result", json.dumps(body))
+    pipe.expire(PREFIX + run, TTL, nx=True)  # the run may have expired since HGETALL
+    if not pipe.execute()[0]:
         # Another process froze it first, maybe from a different snapshot; its answer is the answer.
         return 200, json.loads(store.hget(PREFIX + run, "result"))
     store.eval(RELEASE, 1, ACTIVE, run)
