@@ -27,7 +27,7 @@ from laravel_cloud_queues import Registry, current_job
 import checks
 import logs
 import throughput
-from telemetry import BURST_SIZE, CHECK_KINDS, DELAY_SECONDS, TIMEOUT_SECONDS, Telemetry
+from telemetry import BURST_SIZE, CHECK_DEADLINE, CHECK_KINDS, DELAY_SECONDS, TIMEOUT_SECONDS, Telemetry
 
 # The queue CLI imports app:registry, so a worker process is the one running `work`.
 LOG_ROLE = "worker" if "work" in sys.argv else "web"
@@ -103,8 +103,18 @@ def dispatch(kind: str) -> list[str]:
     return uuids
 
 
-def run_check() -> None:
+CHECK_LOCK = "lcq-demo:check-lock"
+
+
+def run_check() -> bool:
+    """Start the queue check unless one is already running anywhere (its timeout case restarts workers)."""
+    if not telemetry.store.set(CHECK_LOCK, "1", nx=True, ex=CHECK_DEADLINE):
+        evaluated = telemetry.evaluate()
+        if evaluated is None or evaluated["status"] == "running":
+            return False
+        telemetry.store.set(CHECK_LOCK, "1", ex=CHECK_DEADLINE)  # previous check finished early
     telemetry.save_check({kind: dispatch(kind) for kind in CHECK_KINDS})
+    return True
 
 
 def started(server: str) -> None:
@@ -172,16 +182,14 @@ def _handle(method: str, path: str, headers: Mapping[str, str], body: bytes) -> 
             return json_response(*throughput.status(path.removeprefix("/api/throughput/")))
     elif method == "POST":
         if path == "/api/check":
-            run_check()
+            if not run_check():
+                return json_response(409, {"error": "a queue check is already running"})
             return json_response(200, {"ok": True})
         if path == "/api/throughput":
             return json_response(*throughput.start(data))
         if path == "/api/reset":
             telemetry.reset()
             return json_response(200, {"ok": True})
-        kind = path.removeprefix("/api/dispatch/")
-        if kind in DISPATCHES:
-            return json_response(200, {"uuids": dispatch(kind)})
     return json_response(404, {"error": "not found"})
 
 
@@ -200,10 +208,11 @@ def self_check() -> None:
     assert handle("GET", "/", {"X-Request-ID": "bad id!"}, b"")[1][-1][1] != "bad id!"
     with patch.object(telemetry, "snapshot", side_effect=RuntimeError("redis down")):
         assert handle("GET", "/api/stats", {}, b"")[0] == 503
-    with patch(__name__ + ".dispatch", return_value=["u"]) as sent, patch.object(telemetry, "save_check") as saved:
+    with patch(__name__ + ".run_check", return_value=True):
         assert handle("POST", "/api/check", {"content-type": "application/json"}, b"")[0] == 200
-        assert sent.call_count == len(CHECK_KINDS) and saved.call_count == 1
-        assert handle("POST", "/api/dispatch/quick", {"Content-Type": "application/json"}, b"{}")[0] == 200
+    with patch(__name__ + ".run_check", return_value=False):
+        assert handle("POST", "/api/check", {"Content-Type": "application/json"}, b"{}")[0] == 409
+    assert handle("POST", "/api/dispatch/timeout", {"Content-Type": "application/json"}, b"{}")[0] == 404
     assert logs.CONTEXT.get() == {}
     print("Router contract checks passed")
 

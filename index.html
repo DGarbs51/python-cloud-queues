@@ -190,6 +190,8 @@
             groups.append(groupEl(g.name, g.checks));
           }
         } else {
+          // A check list we couldn't load is never a pass.
+          statuses.push(checks.status === 404 ? "warn" : "fail");
           groups.append(groupEl("Server checks", [], checks.status === 404
             ? "This check list isn't available on this deployment yet."
             : problem("Couldn't load the check list", checks)));
@@ -197,7 +199,8 @@
 
         const queue = el("div");
         groups.append(queue);
-        if (start.status !== 200) {
+        // 409: a queue check started elsewhere is still running; follow that one.
+        if (start.status !== 200 && start.status !== 409) {
           queue.append(groupEl("Queue", [], problem("Couldn't start the queue check", start) +
             (start.status === 503 ? " Is a Redis/Valkey cache attached (REDIS_URL)?" : "")));
           say("Finished, but the queue check could not start.");

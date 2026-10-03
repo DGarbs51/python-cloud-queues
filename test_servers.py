@@ -37,7 +37,8 @@ def free_port() -> int:
 def request(port, method, path, body=b"", headers=None):
     conn = http.client.HTTPConnection("::1", port, timeout=10)
     try:
-        conn.request(method, path, body=body, headers=headers or {})
+        conn.request(method, path, body=body, headers=headers or {},
+                     encode_chunked=(headers or {}).get("Transfer-Encoding") == "chunked")
         response = conn.getresponse()
         return response.status, {k.lower(): v for k, v in response.getheaders()}, response.read()
     finally:
@@ -67,6 +68,10 @@ def check(server: str) -> None:
             assert request(port, "GET", "/")[0] == 200
             assert request(port, "GET", "/nope")[0] == 404
             assert request(port, "POST", "/api/check", b"{}", {"Content-Type": "text/plain"})[0] == 415
+            # Chunked bodies (no Content-Length) get the same JSON checks as sized ones.
+            chunked = request(port, "POST", "/api/check", iter([b"[", b"]"]),
+                              {"Content-Type": "application/json", "Transfer-Encoding": "chunked"})
+            assert chunked[0] == 400, f"{server} chunked body: {chunked}"
             big = b"x" * (64 * 1024 + 1)
             assert request(port, "POST", "/api/check", big, {"Content-Type": "application/json"})[0] == 400
             os.killpg(proc.pid, signal.SIGTERM)

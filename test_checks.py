@@ -81,6 +81,48 @@ def main() -> None:
         os.environ.pop("DATABASE_URL", None)
         assert next(r for r in offline_run({}) if r["id"] == "services.database")["status"] == "skip"
 
+    # A malformed service URL fails its own rows, never the whole list.
+    bad_url = {r["id"]: r["status"] for r in offline_run({}, DATABASE_URL="mysql://[broken")}
+    assert bad_url["services.database"] == "fail" and bad_url["runtime.threads"] == "pass"
+
+    # No Redis URL at all is a skip, not a fail.
+    with patch.dict(os.environ):
+        for name in ("REDIS_URL", "LARAVEL_CLOUD_QUEUES_REDIS_URL"):
+            os.environ.pop(name, None)
+        assert next(r for r in offline_run({}) if r["id"] == "services.redis")["status"] == "skip"
+
+    # A hung check is reported at the deadline instead of hanging the endpoint.
+    import threading
+    release = threading.Event()
+    with patch.object(checks, "DEADLINE", 0.5), patch("pymysql.connect", side_effect=lambda **_: release.wait(10)):
+        started = time.monotonic()
+        hung = {r["id"]: r for r in offline_run({}, DATABASE_URL="mysql://u@127.0.0.1:1/db")}
+        assert time.monotonic() - started < 3
+    release.set()
+    assert hung["services.database"]["status"] == "fail" and "no answer" in hung["services.database"]["detail"]
+
+    # Listening port: read from /proc on Linux, judged on [::] vs IPv4-only.
+    with patch.dict(os.environ, PORT="8000"), patch.object(checks.Path, "is_file", return_value=True):
+        with patch.object(checks, "_listeners", return_value={"::"}):
+            assert checks.web_port({})[0] == "pass"
+        with patch.object(checks, "_listeners", return_value={"0.0.0.0"}):
+            assert checks.web_port({})[0] == "fail"
+        with patch.object(checks, "_listeners", return_value=set()):
+            assert checks.web_port({})[0] == "warn"
+    # /proc/net parsing: port 8000 = 0x1F40, state 0A = LISTEN, 01 = ESTABLISHED.
+    head = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n"
+    tables = {
+        "tcp6": head + "   0: 00000000000000000000000000000000:1F40 00000000000000000000000000000000:0000 0A 0:0 00:0 0 1000 0 1\n",
+        "tcp": head + "   0: 0100007F:1F40 00000000:0000 0A 0:0 00:0 0 1000 0 2\n"
+                      "   1: 00000000:1F41 00000000:0000 0A 0:0 00:0 0 1000 0 3\n"
+                      "   2: 00000000:1F40 0100007F:9999 01 0:0 00:0 0 1000 0 4\n",
+    }
+    with patch.object(checks.Path, "read_text", lambda self: tables[self.name]):
+        assert checks._listeners(8000) == {"::", "0100007F"}
+        assert checks._listeners(8001) == {"0.0.0.0"}
+    with patch.dict(os.environ, PORT="nope"):
+        assert checks.web_port({})[0] == "warn"
+
     # The endpoint finishes fast even with every network check stubbed.
     started = time.monotonic()
     offline_run({})

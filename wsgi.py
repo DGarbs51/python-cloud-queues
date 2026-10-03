@@ -16,6 +16,12 @@ def app(environ: dict, start_response):
         length = int(environ.get("CONTENT_LENGTH") or 0)
     except ValueError:
         length = -1
+    if not environ.get("CONTENT_LENGTH") and environ.get("wsgi.input_terminated"):
+        # Chunked body: no length up front, so read one byte past the cap to detect oversize.
+        body = environ["wsgi.input"].read(app_module.MAX_BODY + 1)
+        length = len(body)
+    else:
+        body = None
     if not 0 <= length <= app_module.MAX_BODY:
         status, headers, body = app_module.json_response(400, {"error": "invalid body length (maximum 64 KiB)"})
     else:
@@ -25,7 +31,8 @@ def app(environ: dict, start_response):
         headers = {key[5:].replace("_", "-").title(): value for key, value in environ.items() if key.startswith("HTTP_")}
         if environ.get("CONTENT_TYPE"):
             headers["Content-Type"] = environ["CONTENT_TYPE"]
-        body = environ["wsgi.input"].read(length) if length else b""
+        if body is None:
+            body = environ["wsgi.input"].read(length) if length else b""
         status, headers, body = app_module.handle(environ.get("REQUEST_METHOD", "GET"), path, headers, body)
     start_response(f"{status} {http.client.responses.get(status, 'Error')}", headers)
     return [body]

@@ -17,7 +17,7 @@ import sys
 import tempfile
 import threading
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
@@ -40,7 +40,10 @@ def on_cloud() -> bool:
 def _scrub(text: str) -> str:
     text = USERINFO.sub(r"\1", text)
     for name in ("DATABASE_URL", "REDIS_URL"):
-        password = urlsplit(os.environ.get(name) or "").password
+        try:
+            password = urlsplit(os.environ.get(name) or "").password
+        except ValueError:  # unparsable URL: its own check reports that
+            continue
         for secret in (password, unquote(password or "")):
             if secret:
                 text = text.replace(secret, "***")
@@ -51,10 +54,9 @@ def _redis():
     """The telemetry Redis client with bounded timeouts, or None when no Valkey is attached."""
     import app
 
-    try:
-        client = app.telemetry.store
-    except RuntimeError:
+    if not (os.environ.get("REDIS_URL") or os.environ.get("LARAVEL_CLOUD_QUEUES_REDIS_URL")):
         return None
+    client = app.telemetry.store
     client.connection_pool.connection_kwargs.update(socket_connect_timeout=TIMEOUT, socket_timeout=TIMEOUT)
     return client
 
@@ -114,10 +116,30 @@ def _siblings(parent: int) -> int:
 
 
 def web_port(headers) -> Result:
-    port = os.environ.get("PORT")
-    if port:
-        return "pass", f"PORT={port}", ""
-    return "warn", "PORT is not set", "Cloud tells the server which port to listen on through PORT. Use `--port $PORT` in the start command."
+    port = os.environ.get("PORT", "")
+    if not port.isdigit():
+        return "warn", f"PORT is {port or 'not set'}", "Cloud tells the server which port to listen on through PORT. Use `--port $PORT` in the start command."
+    if not Path("/proc/net/tcp6").is_file():
+        return "skip", f"PORT={port}; listening sockets can't be read here", "Only checked on Linux, which includes Laravel Cloud."
+    listeners = _listeners(int(port))
+    if "::" in listeners:
+        return "pass", f"listening on [::]:{port}", ""
+    if listeners:
+        return "fail", f"listening on {', '.join(sorted(listeners))} port {port}, not [::]", (
+            "Cloud reaches apps over IPv6, so the server must listen on `::`. Use `--host ::` (uvicorn) or `--bind [::]:$PORT` (gunicorn).")
+    return "warn", f"nothing found listening on port {port}", "The server may be listening on a different port than PORT. Use `--port $PORT` in the start command."
+
+
+def _listeners(port: int) -> set[str]:
+    """Addresses in LISTEN state on port, from /proc/net/tcp6 and /proc/net/tcp ("::", "0.0.0.0", or other)."""
+    found = set()
+    for table, wildcard in (("tcp6", "0" * 32), ("tcp", "0" * 8)):
+        for line in Path("/proc/net", table).read_text().splitlines()[1:]:
+            local, state = line.split()[1], line.split()[3]
+            address, hex_port = local.split(":")
+            if state == "0A" and int(hex_port, 16) == port:  # 0A = LISTEN
+                found.add(("::" if table == "tcp6" else "0.0.0.0") if address == wildcard else address)
+    return found
 
 
 def _proxy_header(name: str, expected: str | None = None):
@@ -288,7 +310,7 @@ def database_query(headers) -> Result:
         if tls:
             extra = dict(sslmode="verify-full", sslrootcert=certifi.where()) if verify else dict(sslmode="require")
         conn = psycopg.connect(host=host, port=port, user=user, password=password, dbname=name or None,
-                               connect_timeout=TIMEOUT, **extra)
+                               connect_timeout=TIMEOUT, options=f"-c statement_timeout={TIMEOUT * 1000}", **extra)
     with conn:
         cursor = conn.cursor()
         cursor.execute("SELECT 1")
@@ -355,11 +377,19 @@ def _one(entry, headers) -> dict[str, str]:
     return {"id": id, "label": label, "status": status, "detail": _scrub(detail)[:300], "help": help}
 
 
+DEADLINE = 12  # seconds for the whole list; a check still running then is reported, not awaited
+
+
 def run(headers) -> dict:
-    with ThreadPoolExecutor(len(CHECKS)) as pool:
-        # Copy the context here: worker threads must see LOOP_SECONDS set by asgi.py.
-        futures = [pool.submit(contextvars.copy_context().run, _one, entry, headers) for entry in CHECKS]
-        rows = [future.result() for future in futures]
+    pool = ThreadPoolExecutor(len(CHECKS))
+    # Copy the context per check: worker threads must see LOOP_SECONDS set by asgi.py.
+    futures = [pool.submit(contextvars.copy_context().run, _one, entry, headers) for entry in CHECKS]
+    wait(futures, timeout=DEADLINE)
+    pool.shutdown(wait=False)  # a hung check keeps its thread; the response doesn't wait for it
+    rows = [future.result() if future.done() else
+            {"id": entry[1], "label": entry[2], "status": "fail", "detail": f"no answer within {DEADLINE} s",
+             "help": "This check hung. The service it talks to accepted the connection but stopped responding."}
+            for entry, future in zip(CHECKS, futures)]
     groups: dict[str, list] = {}
     for entry, row in zip(CHECKS, rows):
         groups.setdefault(entry[0], []).append(row)

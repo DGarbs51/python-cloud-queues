@@ -21,6 +21,8 @@ from laravel_cloud_queues import current_job
 
 PREFIX = "lcq-throughput:"
 ACTIVE = PREFIX + "active"  # holds the run id of the one run allowed at a time
+# Delete the lock only if this run still owns it.
+RELEASE = "if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) end return 0"
 TTL = 3600
 DEFAULT_COUNT = 1000
 MAX_COUNT = 10_000
@@ -72,6 +74,8 @@ def install(registry, telemetry, log) -> None:
         # Wait spans web and worker clocks, so it includes any clock skew between them.
         pipe.hsetnx(PREFIX + run, "w:" + uid, started - queued_at)
         pipe.hsetnx(PREFIX + run, "f:" + uid, time.time())
+        # A job delivered after the run expired recreates the hash; give it a TTL so it can't leak.
+        pipe.expire(PREFIX + run, TTL, nx=True)
         pipe.execute()
 
     tick = registry.job(name="throughput.tick")(_tick)
@@ -93,12 +97,10 @@ def start(data: dict) -> tuple[int, dict]:
         return 400, {"error": count}
     store, run = _telemetry.store, uuid.uuid4().hex
     ttl = int(deadline(count)) + 60
+    # One run at a time across every web process and replica. status() frees the lock when the
+    # run finishes; the TTL frees it if nobody polls.
     if not store.set(ACTIVE, run, nx=True, ex=ttl):
-        active = store.get(ACTIVE)
-        # status() frees the lock itself once a run has finished.
-        if active and status(active)[1].get("state") == "running":
-            return 409, {"error": "a throughput run is already active", "run": active}
-        store.set(ACTIVE, run, ex=ttl)  # ponytail: check-then-set race; use a Lua CAS if concurrent POSTs matter
+        return 409, {"error": "a throughput run is already active", "run": store.get(ACTIVE)}
     pipe = store.pipeline()
     pipe.hset(PREFIX + run, mapping={"count": count, "started_at": time.time()})
     pipe.expire(PREFIX + run, TTL)
@@ -117,6 +119,8 @@ def status(run: str) -> tuple[int, dict]:
         return 404, {"error": "unknown run"}
     if "result" in raw:
         return 200, json.loads(raw["result"])
+    if "count" not in raw:  # recreated by a late job after the run expired
+        return 404, {"error": "unknown run"}
     count, started = int(raw["count"]), float(raw["started_at"])
     waits = [float(v) for k, v in raw.items() if k.startswith("w:")]
     finishes = [float(v) for k, v in raw.items() if k.startswith("f:")]
@@ -136,9 +140,10 @@ def status(run: str) -> tuple[int, dict]:
     if failed:
         body["error"] = raw["error"]
     # First finisher freezes the result so later polls (and late jobs) cannot change it.
-    if store.hsetnx(PREFIX + run, "result", json.dumps(body)):
-        if store.get(ACTIVE) == run:
-            store.delete(ACTIVE)
-        _log.info("throughput finished", extra=dict(run=run, verdict=body["verdict"],
-                                                    jobs_per_s=jobs_per_s, p95_ms=wait_ms["p95"]))
+    if not store.hsetnx(PREFIX + run, "result", json.dumps(body)):
+        # Another process froze it first, maybe from a different snapshot; its answer is the answer.
+        return 200, json.loads(store.hget(PREFIX + run, "result"))
+    store.eval(RELEASE, 1, ACTIVE, run)
+    _log.info("throughput finished", extra=dict(run=run, verdict=body["verdict"],
+                                                jobs_per_s=jobs_per_s, p95_ms=wait_ms["p95"]))
     return 200, body

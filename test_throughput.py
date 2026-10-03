@@ -54,6 +54,9 @@ if store is None:
     print("throughput math checks passed (live section skipped: REDIS_URL not reachable)")
     raise SystemExit(0)
 
+# Own key namespace: never touch a real run's lock or hash.
+t.PREFIX = f"lcq-throughput-test-{uuid.uuid4().hex}:"
+t.ACTIVE = t.PREFIX + "active"
 messages = []
 t._telemetry = SimpleNamespace(store=store)
 t._log = SimpleNamespace(info=lambda msg, extra=None: messages.append((msg, extra)))
@@ -77,6 +80,18 @@ try:
     assert [m for m, _ in messages] == ["throughput finished"]
     store.hset(key, "f:late", now)  # a late job after the verdict must not change it
     assert t.status(run) == (200, body) and len(messages) == 1
+    # A second process that loses the freeze returns the stored result, not its own.
+    store.hdel(key, "result")
+    store.hset(key, "result", json.dumps({**body, "verdict": "pass"}))
+    assert t.status(run)[1]["verdict"] == "pass"
+    # Lock: NX only; a second start is refused while one is active.
+    store.set(t.ACTIVE, "other", ex=60)
+    assert t.start({"count": 1})[0] == 409
+    assert store.get(t.ACTIVE) == "other"
+    # A hash recreated by a late job (no count) reads as unknown.
+    store.delete(key)
+    store.hset(key, "f:late", now)
+    assert t.status(run)[0] == 404
 finally:
     store.delete(key, t.ACTIVE)
 print("throughput checks passed (live section ran)")
