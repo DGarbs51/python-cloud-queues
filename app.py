@@ -32,6 +32,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from laravel_cloud_logging import cloud_request_id
 from laravel_cloud_queues import Job, Registry, RetryPolicy, current_job
 from redis.exceptions import NoScriptError
 from telemetry import (
@@ -46,12 +47,7 @@ import logs
 
 # Registry imports are the queue CLI's worker entrypoint. Web adapters import this too.
 LOG_ROLE = "worker" if "work" in sys.argv else "web"
-if os.environ.get("LOG_CONFIG") == "sample":
-    import cloud_logging
-    cloud_logging.configure()
-    log = logging.getLogger("cloud_demo")
-else:
-    log = logs.setup(LOG_ROLE)
+log = logs.setup(LOG_ROLE)
 registry = Registry()
 telemetry = Telemetry(registry, "Plain Python")
 INDEX = Path(__file__).with_name("index.html")
@@ -133,8 +129,8 @@ elif "asgi" in sys.modules:
     SERVER = SERVER_NAME = "uvicorn"
 # Spawned uvicorn workers re-import this launcher before importing asgi's app.
 if not any(arg.startswith("--self-check") for arg in sys.argv) and not (__name__ in ("__main__", "__mp_main__") and SERVER != "stdlib"):
-    log.info("startup", extra={"fields": dict(server=SERVER, port=os.environ.get("PORT", "8000"),
-             web_concurrency=os.environ.get("WEB_CONCURRENCY", "1")) if LOG_ROLE == "web" else {}})
+    log.info("startup", extra=dict(server=SERVER, port=os.environ.get("PORT", "8000"),
+             web_concurrency=os.environ.get("WEB_CONCURRENCY", "1")) if LOG_ROLE == "web" else {})
 MAX_BODY = 64 * 1024
 TERMINAL = {"done", "failed", "expired"}
 HOLD_LOCK = threading.Lock()
@@ -225,14 +221,14 @@ def job_logging(*, run=None, log_index=0):
                 # Dispatch ordinal makes sampling stable across processes and retries.
                 sampled = count <= 200 or log_index % math.ceil(count / 100) == 0
             if sampled:
-                log.info("job start", extra={"fields": memory_sample()})
+                log.info("job start", extra=memory_sample())
             yield
         except Exception:
-            log.exception("job fail", extra={"fields": dict(duration_ms=round((time.monotonic() - started) * 1000, 2), **memory_sample())})
+            log.exception("job fail", extra=dict(duration_ms=round((time.monotonic() - started) * 1000, 2), **memory_sample()))
             raise
         else:
             if sampled:
-                log.info("job finish", extra={"fields": dict(duration_ms=round((time.monotonic() - started) * 1000, 2), **memory_sample())})
+                log.info("job finish", extra=dict(duration_ms=round((time.monotonic() - started) * 1000, 2), **memory_sample()))
 
 
 @contextmanager
@@ -381,7 +377,7 @@ def compat_probes() -> list:
         return [{"name": "compat", "group": "runtime", "min_python": "3.10",
                  "status": "info", "detail": "compat module missing"}]
     probes = run_probes()
-    log.info("compat complete", extra={"fields": dict(counts=dict(Counter(p["status"] for p in probes)))})
+    log.info("compat complete", extra=dict(counts=dict(Counter(p["status"] for p in probes))))
     return probes
 
 
@@ -486,7 +482,7 @@ def load_snapshot(run: str) -> dict | None:
                 oom_events=sum(high - low for low, high in oom_by_host.values()))
     if state in TERMINAL:
         if telemetry.store.set(key + ":logged-terminal", "1", nx=True, ex=TTL):
-            log.info("run terminal", extra={"fields": result})
+            log.info("run terminal", extra=result)
         release_active(run)
         if config["kind"] == "db_write":
             import db
@@ -521,7 +517,7 @@ def _dispatch_load(run: str, config: dict) -> None:
     error = ""
     dispatched = 0
     progress = 0
-    log.info("dispatch start", extra={"fields": config})
+    log.info("dispatch start", extra=config)
     try:
         for _ in range(config["count"]):
             if store.exists(key + ":cancel"):
@@ -543,13 +539,13 @@ def _dispatch_load(run: str, config: dict) -> None:
             percent = dispatched * 100 // config["count"]
             if percent // 10 > progress:
                 progress = percent // 10
-                log.info("dispatch progress", extra={"fields": dict(dispatched=dispatched, percent=percent)})
+                log.info("dispatch progress", extra=dict(dispatched=dispatched, percent=percent))
     except Exception as exc:
         log.exception("Load dispatch failed: %s", run)
         error = f"{type(exc).__name__}: {exc}"[:200]
     finally:
         store.hset(key, mapping={"state": "draining", "dispatch_error": error})
-        log.info("dispatch complete", extra={"fields": dict(dispatched=dispatched, error=error)})
+        log.info("dispatch complete", extra=dict(dispatched=dispatched, error=error))
     try:
         while True:
             result = load_snapshot(run)
@@ -639,7 +635,7 @@ def start_load(data: dict) -> tuple[int, dict]:
         store, [ACTIVE, key, RUNS, idempotency or "", queue],
         [run, json.dumps(config), now, deadline, TTL, PREFIX + "run:"],
     )
-    log.info("load admission", extra={"fields": dict(outcome=outcome, run=value or run, count=config["count"])})
+    log.info("load admission", extra=dict(outcome=outcome, run=value or run, count=config["count"]))
     if outcome == "reused":
         return 202, {"run": value, "requested": config["count"]}
     if outcome != "created":
@@ -654,7 +650,7 @@ def start_load(data: dict) -> tuple[int, dict]:
 
 
 def hold_memory(mb: int, seconds: int) -> None:
-    log.info("hold start", extra={"fields": dict(mb=mb, seconds=seconds)})
+    log.info("hold start", extra=dict(mb=mb, seconds=seconds))
     try:
         # Closing the mapping returns pages to the OS even when Python's allocator caches buffers.
         with mmap.mmap(-1, mb * 1048576) as memory:
@@ -664,7 +660,7 @@ def hold_memory(mb: int, seconds: int) -> None:
     except Exception:
         log.exception("Memory hold failed")
     finally:
-        log.info("hold stop", extra={"fields": dict(mb=mb)})
+        log.info("hold stop", extra=dict(mb=mb))
         HOLD_LOCK.release()
 
 
@@ -769,12 +765,12 @@ def emit_logtest(marker, format, burst, role):
         return 1
     """, 2, PREFIX + "logtest:active", key, marker, role, TTL)
     if not started:
-        log.warning("logtest stale or duplicate delivery skipped", extra={"fields": dict(marker=marker, role=role)})
+        log.warning("logtest stale or duplicate delivery skipped", extra=dict(marker=marker, role=role))
         return
     try:
         logs.emit_tests(marker, format, burst, role)
     except Exception:
-        log.exception("logtest failed", extra={"fields": dict(marker=marker, role=role)})
+        log.exception("logtest failed", extra=dict(marker=marker, role=role))
         finish_logtest(marker, role, "failed")
         raise
     else:
@@ -833,17 +829,21 @@ def self_check_logging():
     from unittest.mock import MagicMock, patch
     imported = subprocess.run([sys.executable, "-c", "import sys; sys.argv = ['cli', 'work']; import app"],
                               cwd=Path(__file__).parent, capture_output=True, text=True, check=True,
-                              env={**os.environ, "LOG_FORMAT": "json", "LOG_LEVEL": "INFO", "LOG_STREAM": "stdout"})
-    startup = next(json.loads(line) for line in imported.stdout.splitlines() if json.loads(line).get("msg") == "startup")
-    assert startup["role"] == "worker" and startup["extra"] == {}
-    output = io.StringIO()
-    owned = log.handlers[0]
-    previous = owned.stream
-    owned.setStream(output)
+                              env={k: v for k, v in {**os.environ, "LOG_LEVEL": "INFO"}.items() if k != "LARAVEL_CLOUD"})
+    startup = next(json.loads(line) for line in imported.stdout.splitlines() if json.loads(line).get("message") == "startup")
+    assert startup["context"] == {"role": "worker"} and startup["level_name"] == "INFO"
+
+    class Captured(io.StringIO):
+        # Off Cloud, CloudHandler writes encoded lines to sys.__stdout__.buffer.
+        buffer = property(lambda self: SimpleNamespace(write=lambda data: self.write(data.decode()), flush=self.flush))
+
+    output = Captured()
+    owned = patch.object(sys, "__stdout__", output)
+    owned.start()
     try:
         status, headers, _ = handle("GET", "/api/ping?password=never-log-this", {"X-Request-ID": "l6-check"}, b"")
         assert status == 200 and ("X-Request-ID", "l6-check") in headers
-        assert output.getvalue().count('msg=access') + output.getvalue().count('"msg":"access"') + output.getvalue().count('msg="access"') == 1
+        assert output.getvalue().count('"message":"access"') == 1
         assert "l6-check" in output.getvalue() and "never-log-this" not in output.getvalue()
         assert logs.CONTEXT.get() == {}
         output.seek(0)
@@ -927,7 +927,7 @@ def self_check_logging():
                 worker_logtest(result["marker"], "all", 2)
                 emit.assert_called_once_with(result["marker"], "all", 2, "worker")
     finally:
-        owned.setStream(previous)
+        owned.stop()
 
 
 def access_response(method, path, request_id, started, response):
@@ -942,7 +942,7 @@ def access_response(method, path, request_id, started, response):
             fields["reason"] = json.loads(body).get("error", "request rejected")
         except (ValueError, AttributeError):
             fields["reason"] = "request rejected"
-    log.log(level, "access", extra={"fields": fields})
+    log.log(level, "access", extra=fields)
     return status, [*headers, ("X-Request-ID", request_id)], body
 
 
@@ -1074,7 +1074,12 @@ class Handler(BaseHTTPRequestHandler):
                 response = access_response(self.command, self.path.split("?", 1)[0], request_id, time.monotonic(),
                                            json_response(400, {"error": "invalid body length (maximum 64 KiB)"}))
         else:
-            response = handle(self.command, self.path, dict(self.headers), self.rfile.read(length))
+            # wsgi.py/asgi.py get this from the package middleware; the stdlib server sets it here.
+            request = cloud_request_id.set(self.headers.get("Cloud-Request-ID"))
+            try:
+                response = handle(self.command, self.path, dict(self.headers), self.rfile.read(length))
+            finally:
+                cloud_request_id.reset(request)
         status, headers, body = response
         self.send_response(status)
         for name, value in headers:
@@ -1245,9 +1250,9 @@ def self_check_logtest():
                         assert all(p["sha256_match"] for p in row["payloads"])
                     if row["case"] == "secret_sentinel":
                         assert row["secret_visible"] == {"filtered": False, "raw_control": True}
-            access = [json.loads(e["message"]) for e in entries if e["message"].startswith('{"ts"') and '"msg":"access"' in e["message"]]
+            access = [json.loads(e["message"]) for e in entries if e["message"].startswith('{"message":"access"')]
             assert len(access) == 3, len(access)
-            assert all(e["request_id"] == "l6-local-request" for e in access)
+            assert all(e["context"]["request_id"] == "l6-local-request" for e in access)
         print("Local Redis/MySQL, stdlib HTTP, WSGI/ASGI calls and direct worker logtest checks passed")
     finally:
         keys = list(store.scan_iter(namespace + "*"))
@@ -1430,15 +1435,11 @@ if __name__ == "__main__":
     if SERVER == "gunicorn":
         os.execvp("gunicorn", ["gunicorn", "wsgi:app", "-b", f"[::]:{port}"])
     elif SERVER == "uvicorn":
-        if os.environ.get("LOG_CONFIG") == "sample":
-            import uvicorn
-            uvicorn.run("asgi:app", host="::", port=port, log_config=None,
-                        workers=int(os.environ.get("WEB_CONCURRENCY") or "1"))
-            raise SystemExit(0)
-        args = ["uvicorn", "asgi:app", "--host", "::", "--port", str(port), "--no-access-log"]
-        if "WEB_CONCURRENCY" in os.environ:
-            args += ["--workers", os.environ["WEB_CONCURRENCY"]]
-        os.execvp("uvicorn", args)
+        import uvicorn
+        # log_config=None keeps uvicorn from replacing laravel-cloud-logging's handlers.
+        uvicorn.run("asgi:app", host="::", port=port, log_config=None,
+                    workers=int(os.environ.get("WEB_CONCURRENCY") or "1"))
+        raise SystemExit(0)
     elif SERVER != "stdlib":
         raise SystemExit("SERVER must be stdlib, gunicorn or uvicorn")
     try:

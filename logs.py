@@ -1,4 +1,4 @@
-"""Application-owned stdlib logging; never changes the root or queue SDK loggers."""
+"""App logging setup (laravel-cloud-logging) plus the logtest probe formats, redaction and context."""
 from __future__ import annotations
 
 import atexit
@@ -20,10 +20,11 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from urllib.parse import quote, unquote
 
+from laravel_cloud_logging import configure
+
 CONTEXT = contextvars.ContextVar("log_context", default={})
 LOGGER = logging.getLogger("cloud_demo")
 LOCK = threading.RLock()
-_SETTINGS_WARNED = False
 FORMATS = ("json", "text", "logfmt")
 CASES = ("levels", "stderr_vs_stdout", "traceback", "exception_group", "unicode", "ansi",
          "long_lines", "embedded_newline", "json_nested", "print_unflushed", "burst",
@@ -158,28 +159,31 @@ def handler(role, fmt, stream=None):
     return result
 
 
+class ContextFilter(logging.Filter):
+    """Copy role and logs.context() values into the record; laravel-cloud-logging puts them in context."""
+
+    def __init__(self, role):
+        super().__init__()
+        self.role = role
+
+    def filter(self, record):
+        # extra= wins over request/job context, so a field named like a context key never raises.
+        for key, value in {"role": self.role, **CONTEXT.get()}.items():
+            record.__dict__.setdefault(key, value)
+        return True
+
+
 def setup(role: str):
+    """App logging goes through laravel-cloud-logging; the format/stream settings only drive the probes."""
     if role not in ("web", "worker"):
         raise ValueError("role must be web or worker")
-    global _SETTINGS_WARNED
-    config, invalid = _settings()
     with LOCK:
-        if not LOGGER.handlers:
-            LOGGER.addHandler(handler(role, config["format"]))
+        if not getattr(setup, "registered", False):
+            setup.registered = True
             atexit.register(lambda: LOGGER.info("shutdown"))
-        else:
-            for owned in LOGGER.handlers:
-                for filt in owned.filters:
-                    if isinstance(filt, RedactionFilter):
-                        filt.role = role
-        LOGGER.setLevel(config["level"])
-        LOGGER.propagate = False
-        if invalid and not _SETTINGS_WARNED:
-            _SETTINGS_WARNED = True
-            # Configuration diagnostics must be visible even with LOG_LEVEL=CRITICAL.
-            LOGGER.handle(LOGGER.makeRecord(LOGGER.name, logging.WARNING, __file__, 0,
-                          "invalid logging settings; using defaults", (), None,
-                          extra={"fields": {"settings": invalid}}))
+        configure()  # replaces the root handlers, so every call adds the filter to fresh ones
+        for owned in logging.getLogger().handlers:
+            owned.addFilter(ContextFilter(role))
     return LOGGER
 
 
@@ -311,18 +315,16 @@ def self_check():
             out.handle(logging.LogRecord("test", logging.INFO, __file__, 1, "%d", ("bad-argument",), None))
             assert "log record formatting failed" in stream.getvalue()
             assert "bad-argument" not in stream.getvalue()
-    root_handlers = list(logging.getLogger().handlers)
+    from laravel_cloud_logging import CloudHandler
     setup("web")
-    setup("web")
-    assert len(LOGGER.handlers) == 1 and not LOGGER.propagate
-    assert list(logging.getLogger().handlers) == root_handlers
+    setup("worker")
+    root = logging.getLogger().handlers
+    assert len(root) == 1 and isinstance(root[0], CloudHandler) and LOGGER.propagate
+    assert [f.role for f in root[0].filters if isinstance(f, ContextFilter)] == ["worker"]
+    record = LOGGER.makeRecord(LOGGER.name, logging.INFO, __file__, 1, "x", (), None, extra={"run": "extra"})
+    with context(run="context", job="demo"):
+        root[0].filters[0].filter(record)
+    assert (record.role, record.run, record.job) == ("worker", "extra", "demo")
     assert CONTEXT.get() == {}
-    with patch.dict(os.environ, {"LOG_FORMAT": "bad", "LOG_LEVEL": "warn", "LOG_STREAM": "bad", "LARAVEL_CLOUD": "1"}), \
-            patch(__name__ + "._SETTINGS_WARNED", False), patch.object(LOGGER, "handle") as warning:
-        assert settings() == dict(format="json", level="INFO", stream="stdout")
-        setup("worker")
-        setup("worker")
-        warning.assert_called_once()
-        assert warning.call_args.args[0].levelno == logging.WARNING
     setup("web")
     print("Logging formatter, redaction, context and idempotency checks passed")

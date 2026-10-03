@@ -14,6 +14,8 @@ import time
 import traceback
 import urllib.parse
 
+from laravel_cloud_logging import asgi_middleware
+
 import app as app_module
 from app import handle
 
@@ -338,3 +340,7 @@ async def _send_json(send, status: int, payload: dict, close: bool = False) -> N
     if close:
         headers.append(("Connection", "close"))
     await _send(send, status, headers, body)
+
+
+# Adds Cloud-Request-ID to every log line written during the request.
+app = asgi_middleware(app)

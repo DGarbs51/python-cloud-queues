@@ -392,21 +392,24 @@ After the measurement windows:
 
 ## Logging
 
-`logs.setup(role)` configures only the `cloud_demo` logger, once per process.
-The root logger and the queue SDK's own JSON output are untouched. App imports
-configure the registry worker path and all three web entrypoints. `LOG_FORMAT`
-is `json` on Cloud (`LARAVEL_CLOUD` is present), otherwise `text`; `logfmt` is
-also supported. `LOG_LEVEL=INFO` and `LOG_STREAM=stdout` are the defaults.
-Invalid `LOG_*` values fall back individually to these defaults and produce one
-WARNING per process rather than preventing startup. Worker startup omits web
-server/port fields. Malformed logging arguments produce a minimal safe error
-record without throwing into the caller or echoing the offending arguments.
-JSON includes UTC millisecond timestamps, severity, logger, role, release,
-environment, host, PID, Python version, context, structured `extra`, and an
-escaped full traceback in `exc`. Logfmt quotes/escapes values; text deliberately
-keeps multiline tracebacks. Prefer JSON for Cloud: it preserves one logical
-record per physical line. Cloud's outer severity may still say `info`; inspect
-the record's `level` (the platform behavior must be measured, not assumed).
+App logging uses [laravel-cloud-logging](https://pypi.org/project/laravel-cloud-logging/).
+`logs.setup(role)` calls its `configure()` and adds a filter that copies `role`
+and `logs.context()` values (request ID, run, job fields) into each record's
+`context`. `configure()` takes over the root logger, so gunicorn, uvicorn,
+warnings and the queue SDK's logs also become Monolog JSON lines with real
+levels, and uncaught exceptions are logged with their `previous` chain. On
+Cloud lines go to the log socket; locally they go to stdout. `LOG_LEVEL`
+(default `INFO`) sets the level. `wsgi.py` and `asgi.py` wrap the app in the
+package middleware, and the stdlib server sets the same context variable, so
+every line written during a request carries `context.cloud_request_id`. App
+server access logs are off; Cloud's nginx logs each request. The package does
+no redaction.
+
+The logtest probes (`POST /api/logtest`, `scripts/logcheck.py`) keep their own
+handlers: `LOG_FORMAT` (`json` on Cloud, otherwise `text`; `logfmt` too) and
+`LOG_STREAM` only affect them. Probe records are redacted, carry role, release,
+environment, host, PID and Python version, and keep the formats that were used
+to measure Cloud's log handling.
 
 Core requests have one access record, with method, query-free path, status,
 duration and response bytes. `X-Request-ID` is echoed and propagated into

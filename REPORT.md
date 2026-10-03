@@ -53,10 +53,10 @@ The defects that matter most are in the platform's lifecycle and the edges aroun
 
 ## Recommendations: running Python well on Laravel Cloud today
 
-1. **Log JSON.** Use [`cloud_logging.py`](cloud_logging.py):
-   - It needs only the standard library: call `configure()` at startup, or pass its return value to gunicorn as `logconfig_dict`.
-   - It routes app, gunicorn, uvicorn, Django, Celery and warnings logs through one JSON handler with Cloud's level names.
-   - It was verified on Cloud with uvicorn, gunicorn and queue workers.
+1. **Log JSON.** Use [`laravel-cloud-logging`](https://pypi.org/project/laravel-cloud-logging/), which replaced the earlier `cloud_logging.py` sample:
+   - It has no dependencies: call `configure()` at startup, or pass its return value to gunicorn as `logconfig_dict`.
+   - It writes Monolog JSON, so levels, context and exception chains render like a Laravel app's logs. It routes app, server, Django, Celery and warnings logs through one handler.
+   - Its WSGI/ASGI middleware adds the Cloud request ID to every line. This app uses it on all three servers.
 2. **Size workers for 1 vCPU.**
    - CPU work scales only with replicas.
    - `WEB_CONCURRENCY=3` suits I/O-bound apps.

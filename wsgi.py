@@ -13,6 +13,8 @@ import traceback
 import urllib.parse
 from collections.abc import Iterator
 
+from laravel_cloud_logging import wsgi_middleware
+
 import app as app_module
 from app import handle
 
@@ -252,3 +254,7 @@ def _sse_headers() -> list:
 
 def _status(status: int) -> str:
     return f"{status} {http.client.responses.get(status, 'Error')}"
+
+
+# Adds Cloud-Request-ID to every log line written during the request.
+app = wsgi_middleware(app)
