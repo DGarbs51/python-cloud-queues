@@ -311,7 +311,8 @@ def dns_hosts(headers) -> Result:
     for label, host in hosts.items():
         # getaddrinfo has no timeout of its own, so a daemon thread bounds it.
         answer: list = []
-        worker = threading.Thread(target=lambda: answer.append(socket.getaddrinfo(host, None)), daemon=True)
+        # Bind per iteration: a lookup that outlives its timeout must not land in the next host's answer.
+        worker = threading.Thread(target=lambda out=answer, name=host: out.append(socket.getaddrinfo(name, None)), daemon=True)
         worker.start()
         worker.join(TIMEOUT)
         found[label] = bool(answer)
