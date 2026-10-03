@@ -162,7 +162,7 @@ def _handle(method: str, path: str, headers: Mapping[str, str], body: bytes) -> 
         if path == "/api/ping":
             return json_response(200, {"ok": True})
         if path == "/api/stats":
-            return json_response(200, telemetry.snapshot())
+            return json_response(200, {**telemetry.snapshot(), "server": SERVER})
     elif method == "POST":
         if path == "/api/check":
             run_check()
