@@ -162,18 +162,19 @@ wheels = [
 
 [[package]]
 name = "laravel-cloud-queues"
-version = "0.1.2"
+version = "0.2.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "anyio" },
     { name = "boto3" },
     { name = "click" },
     { name = "httpx" },
+    { name = "laravel-cloud-logging" },
     { name = "typing-extensions" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/43/41/7605f105686268be609896af1ef5b21cec7abfcd81ad94b663eee8963ee7/laravel_cloud_queues-0.1.2.tar.gz", hash = "sha256:1139d3d486de80aeb657e951cb94b175c1d778e6357a35ac0c02bc8c874d195b", size = 114359, upload-time = "2026-09-28T21:55:28.523Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/d2/38/7e62daa05dc18a46ea9fdde5c4bb6014f3ed0121f7465f6ee138dd3a174b/laravel_cloud_queues-0.2.0.tar.gz", hash = "sha256:47684387a8d40da58081e6ce5362080fec51c6492b5359dd0b24d2b98131113f", size = 118053, upload-time = "2026-10-03T20:29:44.164Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/af/5d/90b7ab2a97d038b8c39e1629e5ba50a02f05e1a392482aad872b0081d376/laravel_cloud_queues-0.1.2-py3-none-any.whl", hash = "sha256:fcd93a8ecd31cd7bc2abf3a8fb3cfdf4d0ca74b81f96d677b33453e173089064", size = 119055, upload-time = "2026-09-28T21:55:26.948Z" },
+    { url = "https://files.pythonhosted.org/packages/14/9e/7e1849dd0d8ce8f944ca590f8af52958413fafabb0b21225957a826f53f5/laravel_cloud_queues-0.2.0-py3-none-any.whl", hash = "sha256:d450664ffa0a5985eb549947b3282cdf80fb6234786b8c994303e73ac810e07d", size = 122747, upload-time = "2026-10-03T20:29:42.744Z" },
 ]
 
 [package.optional-dependencies]
@@ -300,7 +301,7 @@ requires-dist = [
     { name = "certifi" },
     { name = "gunicorn" },
     { name = "laravel-cloud-logging", specifier = ">=0.2.0" },
-    { name = "laravel-cloud-queues", extras = ["redis"], specifier = ">=0.1.1" },
+    { name = "laravel-cloud-queues", extras = ["redis"], specifier = ">=0.2.0" },
     { name = "psycopg", extras = ["binary"], specifier = ">=3.3.6" },
     { name = "pymysql" },
     { name = "uvicorn" },
