@@ -11,6 +11,8 @@ processes:
     - app.py
     - telemetry.py
     - asgi.py
+    - checks.py
+    - throughput.py
     - .env
     - logs.py
     env: {}
@@ -23,6 +25,8 @@ processes:
     - app.py
     - telemetry.py
     - asgi.py
+    - checks.py
+    - throughput.py
     - .env
     - logs.py
     env: {}
@@ -41,7 +45,7 @@ processes:
     restart_when_changed: []
     env: {}
   test:
-    command: uv run python app.py --self-check && uv run python test_servers.py
+    command: uv run python app.py --self-check && uv run --env-file .env python test_checks.py && uv run --env-file .env python test_throughput.py && uv run python test_servers.py
     working_dir: null
     auto_start: false
     auto_restart: false
