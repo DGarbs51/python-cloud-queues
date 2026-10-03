@@ -209,6 +209,8 @@ def web_upstream_ipv6(headers) -> Result:
     if not on_cloud():
         return "skip", "Not on Laravel Cloud, so no nginx sits in front of this app.", CLOUD_ONLY
     peer = PEER.get()
+    # A dual-stack listener (`--host ::`) sees an IPv4 client as ::ffff:127.0.0.1; it is still IPv4.
+    peer = peer.removeprefix("::ffff:")
     if peer == "::1":
         return "pass", "nginx reaches the app over IPv6 (::1)", ""
     if peer == "127.0.0.1":
