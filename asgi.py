@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import time
 
 from laravel_cloud_logging import asgi_middleware
 
 import app as app_module
+import checks
 
 app_module.started("uvicorn")
 
@@ -33,6 +35,11 @@ async def app(scope: dict, receive, send) -> None:
     else:
         path = scope["path"] + ("?" + scope["query_string"].decode("latin-1") if scope.get("query_string") else "")
         headers = {k.decode("latin-1"): v.decode("latin-1") for k, v in scope["headers"]}
+        if scope["method"] == "GET" and scope["path"] == "/api/checks":
+            # The one check that must run on the event loop: 50 concurrent 0.2 s sleeps take ~0.2 s unless it is blocked.
+            started = time.monotonic()
+            await asyncio.gather(*(asyncio.sleep(0.2) for _ in range(50)))
+            checks.LOOP_SECONDS.set(time.monotonic() - started)
         # handle() is synchronous (Redis); run it off the event loop so slow routes never stall others.
         status, headers, payload = await asyncio.to_thread(app_module.handle, scope["method"], path, headers, body)
     await send({"type": "http.response.start", "status": status,
