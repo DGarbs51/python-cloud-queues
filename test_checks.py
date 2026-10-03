@@ -132,6 +132,20 @@ def main() -> None:
     with patch.dict(os.environ, PORT="nope"):
         assert checks.web_port({})[0] == "warn"
 
+    # CPU/memory rows warn when Python sees more than the cgroup allows (the node), pass when capped.
+    cgroup = {"cpu.max": "200000 100000", "memory.max": str(4096 * 2**20)}
+    with patch.object(checks, "_cgroup", cgroup.get):
+        with patch("os.cpu_count", return_value=16):
+            assert checks.cpu_limit({})[0] == "warn"
+        with patch("os.cpu_count", return_value=2):
+            assert checks.cpu_limit({})[0] == "pass"
+        sizes = {"SC_PAGE_SIZE": 4096}
+        with patch("os.sysconf", lambda name: sizes.get(name, 126511 * 256)):
+            assert checks.memory_limit({})[0] == "warn"
+        with patch("os.sysconf", lambda name: sizes.get(name, 4096 * 256)):
+            status, detail, _ = checks.memory_limit({})
+            assert status == "pass" and "sysconf reports 4096 MiB" in detail, detail
+
     # The endpoint finishes fast even with every network check stubbed.
     started = time.monotonic()
     offline_run({})
