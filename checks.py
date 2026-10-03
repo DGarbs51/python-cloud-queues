@@ -7,7 +7,9 @@ and the checks run in parallel daemon threads under a 12 s deadline.
 
 from __future__ import annotations
 
+import base64
 import contextvars
+import hashlib
 import os
 import re
 import socket
@@ -28,6 +30,8 @@ LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
 CLOUD_ONLY = "Only checked on Laravel Cloud."
 # asgi.py sets this to the measured seconds for 50 concurrent 0.2 s sleeps; unset means WSGI.
 LOOP_SECONDS: contextvars.ContextVar[float | None] = contextvars.ContextVar("loop_seconds", default=None)
+# asgi.py / wsgi.py set this to the address the request came from: nginx's side of the upstream connection.
+PEER: contextvars.ContextVar[str] = contextvars.ContextVar("peer", default="")
 USERINFO = re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://)[^\s/@]*@")
 
 Result = tuple[str, str, str]
@@ -165,6 +169,54 @@ def web_event_loop(headers) -> Result:
     if seconds < 0.5:
         return "pass", detail, ""
     return "fail", detail, "Awaiting many tasks at once took far longer than one sleep, so something is blocking the async event loop. Async requests will queue behind each other."
+
+
+def web_websocket(headers) -> Result:
+    import app
+
+    if not on_cloud():
+        return "skip", "Not on Laravel Cloud, so there is no proxy chain to test.", CLOUD_ONLY
+    if app.SERVER != "uvicorn":
+        return "skip", f"Running on {app.SERVER} (WSGI), which has no WebSockets.", (
+            "Switch the start command to uvicorn to test WebSockets through Cloud's proxy.")
+    host = _header(headers, "host").split(":")[0]
+    if not host:
+        return "fail", "request has no Host header", FAIL_HELP
+    # A raw RFC 6455 handshake to this app's public URL: Cloudflare, Envoy and the pod's nginx must all
+    # pass Upgrade: websocket through for the app to answer 101.
+    key = base64.b64encode(os.urandom(16)).decode()
+    request = (f"GET /ws/echo HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+               f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n")
+    context = ssl.create_default_context()
+    with socket.create_connection((host, 443), timeout=TIMEOUT) as raw, context.wrap_socket(raw, server_hostname=host) as sock:
+        sock.sendall(request.encode())
+        response = b""
+        while b"\r\n\r\n" not in response and len(response) < 16384:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            response += chunk
+    status_line = response.split(b"\r\n", 1)[0].decode(errors="replace")
+    accept = base64.b64encode(hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()).decode()
+    if " 101 " in status_line + " " and accept.encode() in response:
+        return "pass", f"wss://{host}/ws/echo upgraded ({status_line})", ""
+    return "fail", f"wss://{host}/ws/echo answered {status_line or 'nothing'}", (
+        "A proxy between the browser and the app dropped the WebSocket upgrade, so WebSockets (live updates, "
+        "chat, Django Channels) can't connect. The pod's nginx must forward the Upgrade and Connection headers.")
+
+
+def web_upstream_ipv6(headers) -> Result:
+    if not on_cloud():
+        return "skip", "Not on Laravel Cloud, so no nginx sits in front of this app.", CLOUD_ONLY
+    peer = PEER.get()
+    if peer == "::1":
+        return "pass", "nginx reaches the app over IPv6 (::1)", ""
+    if peer == "127.0.0.1":
+        return "warn", "nginx reaches the app over IPv4 (127.0.0.1)", (
+            "This app works because it listens on both IPv4 and IPv6, but an app that listens on IPv6 only "
+            "(for example `--host ::` with IPV6_V6ONLY) would be unreachable. nginx should try [::1] first.")
+    return "warn", f"request came from {peer or 'an unknown address'}, not the pod's nginx", (
+        "Expected nginx on the same pod (::1 or 127.0.0.1).")
 
 
 # Logging
@@ -366,6 +418,8 @@ CHECKS = [
     ("Web", "web.forwarded_for", "Proxy sends X-Forwarded-For", _proxy_header("X-Forwarded-For")),
     ("Web", "web.request_id", "Proxy sends Cloud-Request-ID", _proxy_header("Cloud-Request-ID")),
     ("Web", "web.event_loop", "Async event loop not blocked", web_event_loop),
+    ("Web", "web.websocket", "WebSocket upgrade through Cloud's proxy", web_websocket),
+    ("Web", "web.upstream_ipv6", "nginx reaches the app over IPv6", web_upstream_ipv6),
     ("Logging", "logging.handler", "Cloud logging handler installed", log_handler),
     ("Logging", "logging.socket", "Cloud log socket reachable", log_socket),
     ("Runtime", "runtime.python", "Python version matches .python-version", python_version),

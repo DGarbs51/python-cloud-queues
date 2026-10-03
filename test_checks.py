@@ -5,6 +5,8 @@ Run: uv run --env-file .env python test_checks.py
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import os
 import subprocess
@@ -145,6 +147,43 @@ def main() -> None:
         with patch("os.sysconf", lambda name: sizes.get(name, 4096 * 256)):
             status, detail, _ = checks.memory_limit({})
             assert status == "pass" and "sysconf reports 4096 MiB" in detail, detail
+
+    # WebSocket check: skipped off Cloud and under WSGI; on Cloud a 101 with the right accept key passes.
+    import app as app_module
+    assert checks.web_websocket({"host": "x"})[0] == "skip"  # LARAVEL_CLOUD unset
+    with patch.dict(os.environ, LARAVEL_CLOUD="1"):
+        with patch.object(app_module, "SERVER", "gunicorn"):
+            assert checks.web_websocket({"host": "x"})[0] == "skip"
+
+        class FakeSock:
+            def __init__(self, reply):
+                self.reply = [reply, b""]
+            def __enter__(self):
+                return self
+            def __exit__(self, *exc):
+                return False
+            def sendall(self, data):
+                pass
+            def recv(self, n):
+                return self.reply.pop(0)
+            def wrap_socket(self, sock, server_hostname):
+                return sock
+
+        key = base64.b64encode(b"k" * 16).decode()
+        accept = base64.b64encode(hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest())
+        upgraded = b"HTTP/1.1 101 Switching Protocols\r\nSec-WebSocket-Accept: " + accept + b"\r\n\r\n"
+        for reply, expected in ((upgraded, "pass"), (b"HTTP/1.1 404 Not Found\r\n\r\n", "fail")):
+            with patch.object(app_module, "SERVER", "uvicorn"), patch("os.urandom", return_value=b"k" * 16), \
+                    patch("socket.create_connection", return_value=FakeSock(reply)), \
+                    patch("ssl.create_default_context", return_value=FakeSock(b"")):
+                assert checks.web_websocket({"Host": "app.example"})[0] == expected
+
+        # IPv6 upstream: ::1 passes, 127.0.0.1 warns.
+        for peer, expected in (("::1", "pass"), ("127.0.0.1", "warn"), ("10.0.0.9", "warn")):
+            checks.PEER.set(peer)
+            assert checks.web_upstream_ipv6({})[0] == expected, peer
+        checks.PEER.set("")
+    assert checks.web_upstream_ipv6({})[0] == "skip"
 
     # The endpoint finishes fast even with every network check stubbed.
     started = time.monotonic()

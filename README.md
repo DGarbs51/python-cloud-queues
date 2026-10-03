@@ -9,7 +9,7 @@ It checks the things a real Python app depends on:
 
 | Group | What it checks |
 |---|---|
-| Web | server and process count vs `WEB_CONCURRENCY`, `PORT`, the proxy headers (`X-Forwarded-Proto`, `X-Forwarded-For`, `Cloud-Request-ID`), and that the async event loop isn't blocked (uvicorn only) |
+| Web | server and process count vs `WEB_CONCURRENCY`, `PORT`, the proxy headers (`X-Forwarded-Proto`, `X-Forwarded-For`, `Cloud-Request-ID`), the async event loop isn't blocked, a WebSocket upgrade through Cloud's proxy (uvicorn only), and that the pod's nginx reaches the app over IPv6 |
 | Logging | [laravel-cloud-logging](https://pypi.org/project/laravel-cloud-logging/) is installed and Cloud's log socket is reachable |
 | Runtime | Python version vs `.python-version`, outbound HTTPS, `/tmp`, CPU and memory limits, subprocesses, threads |
 | Services | Valkey/Redis `PING`, database `SELECT 1` (MySQL or Postgres, from `DATABASE_URL`), DNS for both |
