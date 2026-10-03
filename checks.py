@@ -243,7 +243,14 @@ def cpu_limit(headers) -> Result:
     quota, period = value.split()
     if quota == "max":
         return "pass", f"no CPU limit, os.cpu_count()={os.cpu_count()}", ""
-    return "pass", f"CPU limit {int(quota) / int(period):g} vCPU, os.cpu_count()={os.cpu_count()}", ""
+    limit = -(-int(quota) // int(period))  # whole CPUs, rounded up
+    detail = f"CPU limit {int(quota) / int(period):g} vCPU, os.cpu_count()={os.cpu_count()}"
+    if (os.cpu_count() or 0) > limit:
+        return "warn", detail, (
+            "Python sees the whole server's CPUs, not this instance's, so default pool sizes (multiprocessing, "
+            "ProcessPoolExecutor, NumPy/OpenBLAS threads) start too many workers. Set PYTHON_CPU_COUNT (3.13+) "
+            "and size pools explicitly.")
+    return "pass", detail, ""
 
 
 def memory_limit(headers) -> Result:
@@ -252,7 +259,13 @@ def memory_limit(headers) -> Result:
         return "skip", "cgroup v2 memory.max not present", "No container memory limit can be read here (normal on a laptop)."
     if value == "max":
         return "pass", "no memory limit", ""
-    return "pass", f"memory limit {int(value) / 2**20:.0f} MiB", ""
+    seen = os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+    detail = f"memory limit {int(value) / 2**20:.0f} MiB, sysconf reports {seen / 2**20:.0f} MiB"
+    if seen > int(value):
+        return "warn", detail, (
+            "Python sees the whole server's memory, not this instance's limit, so anything sized from physical "
+            "memory (caches, worker counts) can overshoot and get the process killed.")
+    return "pass", detail, ""
 
 
 def subprocess_run(headers) -> Result:

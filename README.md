@@ -48,7 +48,8 @@ Every environment uses the same settings, so results compare across versions:
 - **Valkey cache** attached (Cloud injects `REDIS_URL`) and `LARAVEL_CLOUD_QUEUES_BACKEND=redis`.
 - **Database** (optional) attached; Cloud injects `DATABASE_URL`. Set `DB_SSL_VERIFY=0` for
   Cloud's self-signed database proxy.
-- Build and deploy commands empty.
+- Deploy command empty. Build command (temporary, see [cloud-bootstrap/](cloud-bootstrap/README.md)):
+  `if [ -d cloud-bootstrap ]; then mkdir -p "$(python -m site --user-site)" && cp cloud-bootstrap/laravel_cloud_bootstrap.py cloud-bootstrap/zz_laravel_cloud_bootstrap.pth "$(python -m site --user-site)/"; fi`
 
 Use `--host ::`, not `--host ''`: with several workers uvicorn binds an IPv4-only socket for
 `''`, which Cloud's IPv6 network can't reach.
