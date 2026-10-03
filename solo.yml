@@ -3,7 +3,7 @@ name: python-cloud-queues
 icon: null
 processes:
   Web:
-    command: "set -o pipefail; uv run --env-file .env uvicorn asgi:app --host :: --port 8000 2>&1 | jq -Rr --unbuffered -f scripts/pretty.jq"
+    command: "uv run --env-file .env python -m laravel_cloud_logging.pretty -- uvicorn asgi:app --host :: --port 8000"
     working_dir: null
     auto_start: true
     auto_restart: true
@@ -17,7 +17,7 @@ processes:
     - logs.py
     env: {}
   Worker:
-    command: "set -o pipefail; uv run --env-file .env laravel-cloud-queues work app:registry 2>&1 | jq -Rr --unbuffered -f scripts/pretty.jq"
+    command: uv run --env-file .env python -m laravel_cloud_logging.pretty -- laravel-cloud-queues work app:registry
     working_dir: null
     auto_start: true
     auto_restart: true

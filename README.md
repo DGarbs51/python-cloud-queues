@@ -69,11 +69,17 @@ uv run --env-file .env uvicorn asgi:app --host :: --port 8000   # http://localho
 uv run --env-file .env laravel-cloud-queues work app:registry   # second terminal; more for more workers
 ```
 
-Logs are JSON lines, as on Cloud. To read them in a terminal, pipe through the jq filter:
+In a terminal, logs print as readable lines; piped output and Cloud get the JSON lines Cloud
+parses (`LOG_FORMAT=json` or `line` forces either). To read, filter or follow a running process
+like `php artisan pail`, run it through laravel-cloud-logging's viewer:
 
 ```sh
-uv run --env-file .env uvicorn asgi:app --host :: --port 8000 2>&1 | jq -Rr --unbuffered -f scripts/pretty.jq
+uv run --env-file .env python -m laravel_cloud_logging.pretty -- uvicorn asgi:app --host :: --port 8000
+uv run --env-file .env python -m laravel_cloud_logging.pretty --level warning -- laravel-cloud-queues work app:registry
 ```
+
+It keeps the command's exit code and forwards `SIGTERM`, so supervisors still see crashes.
+`solo.yml` runs Web and Worker this way.
 
 Locally nothing restarts a worker that exits, so the queue's timeout case only passes with a
 restart loop: `while true; do uv run --env-file .env laravel-cloud-queues work app:registry; done`.
@@ -108,4 +114,4 @@ uv run python test_servers.py                  # boots uvicorn and gunicorn with
 - `telemetry.py`: job telemetry and the queue check verdicts.
 - `logs.py`: logging setup through laravel-cloud-logging.
 - `index.html`: the page (Tailwind from a CDN, no build step).
-- `k6/http.js`: HTTP load script. `scripts/pretty.jq`: readable local logs.
+- `k6/http.js`: HTTP load script. `solo.yml`: local Web, Worker and test processes for [Solo](https://soloterm.com).
