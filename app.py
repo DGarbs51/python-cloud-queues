@@ -25,6 +25,7 @@ from urllib.parse import urlsplit
 from laravel_cloud_queues import Registry, current_job
 
 import logs
+import throughput
 from telemetry import BURST_SIZE, CHECK_KINDS, DELAY_SECONDS, TIMEOUT_SECONDS, Telemetry
 
 # The queue CLI imports app:registry, so a worker process is the one running `work`.
@@ -32,6 +33,7 @@ LOG_ROLE = "worker" if "work" in sys.argv else "web"
 log = logs.setup(LOG_ROLE)
 registry = Registry()
 telemetry = Telemetry(registry, "Plain Python")
+throughput.install(registry, telemetry, log)
 INDEX = Path(__file__).with_name("index.html")
 MAX_BODY = 64 * 1024
 SERVER = "unknown"  # set by started()
@@ -163,10 +165,14 @@ def _handle(method: str, path: str, headers: Mapping[str, str], body: bytes) -> 
             return json_response(200, {"ok": True})
         if path == "/api/stats":
             return json_response(200, telemetry.snapshot())
+        if path.startswith("/api/throughput/"):
+            return json_response(*throughput.status(path.removeprefix("/api/throughput/")))
     elif method == "POST":
         if path == "/api/check":
             run_check()
             return json_response(200, {"ok": True})
+        if path == "/api/throughput":
+            return json_response(*throughput.start(data))
         if path == "/api/reset":
             telemetry.reset()
             return json_response(200, {"ok": True})
