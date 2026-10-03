@@ -24,6 +24,7 @@ from urllib.parse import urlsplit
 
 from laravel_cloud_queues import Registry, current_job
 
+import checks
 import logs
 import throughput
 from telemetry import BURST_SIZE, CHECK_KINDS, DELAY_SECONDS, TIMEOUT_SECONDS, Telemetry
@@ -165,6 +166,8 @@ def _handle(method: str, path: str, headers: Mapping[str, str], body: bytes) -> 
             return json_response(200, {"ok": True})
         if path == "/api/stats":
             return json_response(200, {**telemetry.snapshot(), "server": SERVER})
+        if path == "/api/checks":
+            return json_response(200, checks.run(headers))
         if path.startswith("/api/throughput/"):
             return json_response(*throughput.status(path.removeprefix("/api/throughput/")))
     elif method == "POST":
