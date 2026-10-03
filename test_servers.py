@@ -72,6 +72,13 @@ def check(server: str) -> None:
             chunked = request(port, "POST", "/api/check", iter([b"[", b"]"]),
                               {"Content-Type": "application/json", "Transfer-Encoding": "chunked"})
             assert chunked[0] == 400, f"{server} chunked body: {chunked}"
+            # uvicorn serves WebSockets at /ws/echo (the Cloud check upgrades through nginx to here).
+            if server == "uvicorn":
+                with socket.create_connection(("::1", port), timeout=10) as ws:
+                    ws.sendall(b"GET /ws/echo HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+                               b"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n")
+                    reply = ws.recv(4096)
+                assert reply.startswith(b"HTTP/1.1 101") and b"s3pPLMBiTxaQ9kYGzzhZRbK+xOo=" in reply, reply
             big = b"x" * (64 * 1024 + 1)
             assert request(port, "POST", "/api/check", big, {"Content-Type": "application/json"})[0] == 400
             os.killpg(proc.pid, signal.SIGTERM)

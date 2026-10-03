@@ -19,8 +19,13 @@ async def app(scope: dict, receive, send) -> None:
             await send({"type": "lifespan.startup.complete"})
         await send({"type": "lifespan.shutdown.complete"})
         return
+    if scope["type"] == "websocket":
+        await _websocket(scope, receive, send)
+        return
     if scope["type"] != "http":
         return
+    # The address nginx connected from: ::1 when it reaches the app over IPv6, 127.0.0.1 over IPv4.
+    checks.PEER.set((scope.get("client") or ("",))[0])
     body, too_large = b"", False
     while True:
         message = await receive()
@@ -45,6 +50,18 @@ async def app(scope: dict, receive, send) -> None:
     await send({"type": "http.response.start", "status": status,
                 "headers": [(k.lower().encode("latin-1"), v.encode("latin-1")) for k, v in headers]})
     await send({"type": "http.response.body", "body": payload})
+
+
+async def _websocket(scope: dict, receive, send) -> None:
+    """GET /ws/echo: echo text messages until the client closes. Used by the WebSocket check."""
+    if (await receive())["type"] != "websocket.connect":
+        return
+    if scope["path"] != "/ws/echo":
+        await send({"type": "websocket.close", "code": 1008})
+        return
+    await send({"type": "websocket.accept"})
+    while (message := await receive())["type"] == "websocket.receive":
+        await send({"type": "websocket.send", "text": message.get("text") or ""})
 
 
 # Adds Cloud-Request-ID to every log line written during the request.
