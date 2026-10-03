@@ -179,9 +179,11 @@ def main() -> None:
                 assert checks.web_websocket({"Host": "app.example"})[0] == expected
 
         # IPv6 upstream: ::1 passes, 127.0.0.1 warns.
-        for peer, expected in (("::1", "pass"), ("127.0.0.1", "warn"), ("10.0.0.9", "warn")):
+        for peer, expected in (("::1", "pass"), ("127.0.0.1", "warn"), ("::ffff:127.0.0.1", "warn"), ("10.0.0.9", "warn")):
             checks.PEER.set(peer)
             assert checks.web_upstream_ipv6({})[0] == expected, peer
+        checks.PEER.set("::ffff:127.0.0.1")
+        assert "over IPv4 (127.0.0.1)" in checks.web_upstream_ipv6({})[1]
         checks.PEER.set("")
     assert checks.web_upstream_ipv6({})[0] == "skip"
 
