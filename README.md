@@ -9,7 +9,7 @@ It checks the things a real Python app depends on:
 
 | Group | What it checks |
 |---|---|
-| Web | server and process count vs `WEB_CONCURRENCY`, `PORT`, the proxy headers (`X-Forwarded-Proto`, `X-Forwarded-For`, `Cloud-Request-ID`), the async event loop isn't blocked, a WebSocket upgrade through Cloud's proxy (uvicorn only), and that the pod's nginx reaches the app over IPv6 |
+| Web | server and process count vs `WEB_CONCURRENCY`, `PORT`, the proxy headers (`X-Forwarded-Proto`, `X-Forwarded-For`, `Cloud-Request-ID`), the async event loop isn't blocked, a WebSocket upgrade through Cloud's proxy (ASGI servers only), and that the pod's nginx reaches the app over IPv6 |
 | Logging | [laravel-cloud-logging](https://pypi.org/project/laravel-cloud-logging/) is installed and Cloud's log socket is reachable |
 | Runtime | Python version vs `.python-version`, outbound HTTPS, `/tmp`, CPU and memory limits, subprocesses, threads |
 | Services | Valkey/Redis `PING`, database `SELECT 1` (MySQL or Postgres, from `DATABASE_URL`), DNS for both |
@@ -21,27 +21,36 @@ when you run locally.
 
 ## Deploy to Laravel Cloud
 
-One application, one environment per Python version. Each environment tracks a branch that
-differs from `main` only in `.python-version`, which Cloud reads to pick the runtime. 3.14 is
-the default.
+One application, one environment per branch. Each branch differs from `main` only in
+`.python-version` (which Cloud reads to pick the runtime) or `.web-server` (which `serve.py`
+reads to pick the web server). `main` is Python 3.14 on uvicorn.
 
-| Branch | Python |
-|---|---|
-| `python-3.10` … `python-3.14` | 3.10 … 3.14 |
+| Branch | Python | Web server |
+|---|---|---|
+| `python-3.10` … `python-3.14` | 3.10 … 3.14 | uvicorn |
+| `server-gunicorn`, `server-uwsgi`, `server-waitress` | `main`'s | WSGI |
+| `server-granian-wsgi`, `server-hypercorn-wsgi` | `main`'s | WSGI |
+| `server-granian-asgi`, `server-hypercorn-asgi`, `server-daphne` | `main`'s | ASGI |
 
-Pushing a branch deploys its environment. To ship a change to every version:
+These are the servers Cloud's [Python deploy guide](https://cloud.laravel.com/docs/deploy-guides/python#run-a-production-server)
+supports. To test a server on another Python, change `.python-version` on its branch and push.
+
+Pushing a branch deploys its environment. To ship a change to every branch:
 
 ```sh
-for v in 3.10 3.11 3.12 3.13 3.14; do
-  git switch python-$v && git merge --no-edit main && git push
+for b in python-3.10 python-3.11 python-3.12 python-3.13 python-3.14 \
+         server-gunicorn server-uwsgi server-waitress server-granian-wsgi server-granian-asgi \
+         server-hypercorn-wsgi server-hypercorn-asgi server-daphne; do
+  git switch $b && git merge --no-edit main && git push
 done
 git switch main
 ```
 
 Every environment uses the same settings, so results compare across versions:
 
-- **Start command (ASGI, default):** `uvicorn asgi:app --host :: --port $PORT`
-- **Start command (WSGI):** `gunicorn wsgi:app --bind [::]:$PORT` (reads `gunicorn.conf.py`)
+- **Start command:** `python serve.py`. It execs the server named in `.web-server` with the
+  command listed in `serve.py` (`[::]:$PORT`, workers from `WEB_CONCURRENCY`). The `python-3.x`
+  environments may keep `uvicorn asgi:app --host :: --port $PORT`; it runs the same thing.
 - **App and Worker cluster:** `pro.g-2vcpu-4gb`, autoscaling 1–6 replicas (CPU 60%, memory 70%), scale-to-zero off.
 - **Worker cluster:** 4 processes of `laravel-cloud-queues work app:registry`. Don't add
   `--stop-when-empty`: Cloud restarts any worker that exits, which the timeout case relies on.
@@ -51,11 +60,15 @@ Every environment uses the same settings, so results compare across versions:
 - Deploy command empty. Build command (temporary, see [cloud-bootstrap/](cloud-bootstrap/README.md)):
   `if [ -d cloud-bootstrap ]; then mkdir -p "$(python -m site --user-site)" && cp cloud-bootstrap/laravel_cloud_bootstrap.py cloud-bootstrap/zz_laravel_cloud_bootstrap.pth "$(python -m site --user-site)/"; fi`
 
-Use `--host ::`, not `--host ''`: with several workers uvicorn binds an IPv4-only socket for
-`''`, which Cloud's IPv6 network can't reach.
+The server must accept both IPv6 and IPv4 on `$PORT`: Cloud's startup probes connect over IPv6,
+while the pod's nginx currently connects to `127.0.0.1`. `[::]` is dual-stack for most servers;
+waitress makes it IPv6-only, so `serve.py` also gives it `0.0.0.0`. Use `--host ::`, not
+`--host ''`: with several workers uvicorn binds an IPv4-only socket for `''`, which the probes
+can't reach.
 
-To test WSGI, change only the start command and rerun the checks. The page header shows which
-server answered; the async row is skipped under gunicorn.
+The page header shows which server answered. Under WSGI servers the async and WebSocket rows
+are skipped. waitress (threads) and daphne have no process count, so they run one process
+whatever `WEB_CONCURRENCY` says, and waitress exits on SIGTERM without draining requests.
 
 The app has no login. Protect it at the network level.
 
@@ -103,13 +116,14 @@ It ramps to 50 virtual users and fails if more than 1% of requests fail or p95 l
 uv run python app.py --self-check              # router and logging
 uv run --env-file .env python test_checks.py   # check contract
 uv run --env-file .env python test_throughput.py
-uv run python test_servers.py                  # boots uvicorn and gunicorn with the Cloud start commands
+uv run python test_servers.py [server ...]     # boots every server in serve.py the way Cloud does
 ```
 
 ## Files
 
 - `app.py`: queue jobs, the queue check and the `handle()` router both servers share.
-- `asgi.py`, `wsgi.py`, `gunicorn.conf.py`: the uvicorn and gunicorn entrypoints.
+- `serve.py`, `.web-server`: the start command; picks the server.
+- `asgi.py`, `wsgi.py`, `gunicorn.conf.py`: the ASGI and WSGI entrypoints (and gunicorn's settings).
 - `checks.py`: the Web, Logging, Runtime and Services checks behind `GET /api/checks`.
 - `throughput.py`: the throughput test behind `/api/throughput`.
 - `telemetry.py`: job telemetry and the queue check verdicts.
