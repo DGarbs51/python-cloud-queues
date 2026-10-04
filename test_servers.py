@@ -9,7 +9,6 @@ from __future__ import annotations
 import http.client
 import json
 import os
-import re
 import signal
 import socket
 import subprocess
@@ -22,11 +21,9 @@ from serve import COMMANDS, SINGLE_PROCESS
 
 ROOT = Path(__file__).resolve().parent
 ASGI = {name for name, command in COMMANDS.items() if "asgi:app" in command}
-# Only these route their own logs through laravel-cloud-logging; the others print plain lifecycle lines.
-JSON_LOGS = {"uvicorn", "gunicorn"}
-# uvicorn's multi-worker parent never imports the app, so configure() can't reach it
-# (laravel-cloud-logging README "Limits"). Its lifecycle lines stay plain text.
-UVICORN_PARENT = re.compile(r"INFO: +(Uvicorn running on|Started parent process|Received SIGTERM|Waiting for child process|Stopping parent process|Terminated child process)")
+# uWSGI prints its own boot and shutdown lines from C, outside Python logging: always plain text
+# (laravel-cloud-logging README "Limits"). Every other server must write JSON only.
+JSON_LOGS = set(COMMANDS) - {"uwsgi"}
 
 
 def free_port() -> int:
@@ -82,6 +79,14 @@ def check(server: str) -> None:
                                b"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n")
                     reply = ws.recv(4096)
                 assert reply.startswith(b"HTTP/1.1 101") and b"s3pPLMBiTxaQ9kYGzzhZRbK+xOo=" in reply, reply
+            # The server's own error path logs an exception the app doesn't catch (#17).
+            # uWSGI closes the connection without a response instead of sending a 500 (nginx turns it into a 502).
+            try:
+                boom = request(port, "GET", "/api/boom?marker=t-boom", headers={"Cloud-Request-ID": "cr-boom"})[0]
+            except http.client.RemoteDisconnected:
+                boom = None
+            assert boom == (None if server == "uwsgi" else 500), f"{server} /api/boom: {boom}"
+            assert request(port, "GET", "/api/boom-thread?marker=t-thread")[0] == 200
             big = b"x" * (64 * 1024 + 1)
             assert request(port, "POST", "/api/check", big, {"Content-Type": "application/json"})[0] == 400
             os.killpg(proc.pid, signal.SIGTERM)
@@ -94,11 +99,14 @@ def check(server: str) -> None:
                 proc.wait()
         out.seek(0)
         lines = [line for line in out.read().decode(errors="replace").splitlines() if line.strip()]
-    plain = [line for line in lines if not line.startswith("{") and not (server == "uvicorn" and UVICORN_PARENT.match(line))]
+    plain = [line for line in lines if not line.startswith("{")]
     assert server not in JSON_LOGS or not plain, f"{server} wrote plain-text log lines:\n" + "\n".join(plain)
     records = [json.loads(line) for line in lines if line.startswith("{")]
     access = [r for r in records if r["message"] == "access" and r["context"].get("cloud_request_id") == "cr-test"]
     assert len(access) == 1 and access[0]["context"]["path"] == "/api/ping", records
+    for marker in ("t-boom", "t-thread"):
+        errors = [r for r in records if f"uncaught boom {marker}" in json.dumps(r) and r["level"] >= 400]
+        assert len(errors) == 1, f"{server}: expected one ERROR-or-worse record for {marker}, saw {len(errors)}"
     startups = {r["context"].get("pid") for r in records if r["message"] == "startup"}
     expected = 1 if server in SINGLE_PROCESS else 2
     assert len(startups) == expected, f"{server}: expected {expected} workers from WEB_CONCURRENCY, saw {startups}"
@@ -106,6 +114,8 @@ def check(server: str) -> None:
 
 
 if __name__ == "__main__":
+    # What the Cloud build command does; serve.py's commands read it.
+    subprocess.run(["laravel-cloud-logging-config", str(ROOT / "logging.json")], check=True)
     for name in sys.argv[1:] or COMMANDS:
         check(name)
     print("test_servers ok")
