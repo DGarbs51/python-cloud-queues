@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import subprocess
 import sys
 import time
@@ -26,24 +27,33 @@ from app import LOG_TEST_LEVELS, LOG_TEST_UNICODE
 APP = "app-a2daff20-3072-4065-a7fb-08b4e05a5333"
 # Cloudflare's browser integrity check rejects Python's default user agent with 403.
 HEADERS = {"User-Agent": "Mozilla/5.0"}
-# Cloud's level names for the cases /api/log-test logs. DEBUG is below LOG_LEVEL=INFO and must not arrive.
-EXPECTED_LEVELS = {name: name for name in LOG_TEST_LEVELS if name != "debug"}
+# Cloud's level for each case /api/log-test logs. The library sends Monolog's eight levels, but Cloud's log
+# API has four: NOTICE shows as info, CRITICAL/ALERT/EMERGENCY as error. DEBUG is below LOG_LEVEL=INFO.
+EXPECTED_LEVELS = {"info": "info", "notice": "info", "warning": "warning", "error": "error",
+                   "critical": "error", "alert": "error", "emergency": "error"}
+assert set(EXPECTED_LEVELS) | {"debug"} == set(LOG_TEST_LEVELS)
+# Cloud's own supervisor lines (type=system on every runtime), not the app's or the server's.
+PLATFORM = re.compile(r"\[Deploy: \d+\] .*|.* (starting|shut down|shutdown drain.*)\.\.\.|waiting for orphaned processes to finish")
 MULTILINE = "log-test multi-line\nsecond line\nthird line"
 SETTLE_SECONDS = 20  # Cloud's log API lags a few seconds behind
 
 
 def cloud(*args: str):
-    out = subprocess.run(["cpx", "laravel/cloud-cli", *args, "--json", "-n"], capture_output=True, text=True, timeout=120)
-    if out.returncode:
-        raise RuntimeError(f"{args[0]} failed: {out.stdout[-500:]} {out.stderr[-500:]}")
-    return json.loads(out.stdout)
+    for attempt in range(6):
+        out = subprocess.run(["cpx", "laravel/cloud-cli", *args, "--json", "-n"], capture_output=True, text=True, timeout=120)
+        if not out.returncode:
+            return json.loads(out.stdout)
+        if "Too Many Attempts" not in out.stdout + out.stderr:
+            break
+        time.sleep(15 * (attempt + 1))  # the logs API is rate limited per account
+    raise RuntimeError(f"{args[0]} failed: {out.stdout[-500:]} {out.stderr[-500:]}")
 
 
 def logs(env: str, start: datetime, end: datetime) -> list[dict]:
     """Every entry in [start, end]. The API returns at most 100 per query, so query in slices and split full ones."""
     entries: list[dict] = []
     while start < end:
-        stop = min(start + timedelta(seconds=10), end)
+        stop = min(start + timedelta(seconds=60), end)
         entries += _slice(env, start, stop)
         start = stop
     return entries
@@ -102,16 +112,20 @@ def check(env: str, url: str, since: datetime | None) -> dict:
     unicode = by_case.get("unicode", {}).get("message", "")
     results["encoding"] = (unicode == f"log-test unicode {LOG_TEST_UNICODE}", repr(unicode))
 
-    exception = by_case.get("exception", {})
-    detail = context(exception).get("exception") or {}
-    # One entry, at error, with the class and message; traceback lines must not arrive as entries of their own.
-    stray = [e for e in window if "inner cause" in json.dumps(e) and e is not exception]
-    results["traceback"] = (exception.get("level") == "error" and "ValueError" in str(detail.get("class")) and not stray,
-                            f"level={exception.get('level')} class={detail.get('class')} message={detail.get('message')!r} stray={len(stray)}")
+    # Cloud turns a record with an exception into one type=exception entry: the exception's message, class, file and
+    # trace. It drops the log message and context (marker, cloud_request_id), so match on the exception message.
+    exceptions = [e for e in window if e.get("type") == "exception" and e.get("message") == "log-test outer"]
+    exception = exceptions[0] if exceptions else {}
+    detail = exception.get("data") or {}
+    # Traceback lines must not arrive as entries of their own.
+    stray = [e for e in window if "inner cause" in json.dumps(e) or "Traceback" in e.get("message", "")]
+    results["traceback"] = (len(exceptions) == 1 and exception.get("level") == "error" and detail.get("class") == "ValueError"
+                            and bool(detail.get("trace")) and not stray,
+                            f"{len(exceptions)} entries; level={exception.get('level')} class={detail.get('class')} stray={len(stray)}")
 
     for name, tag, code in (("uncaught", f"{marker}-boom", boom_status), ("thread", f"{marker}-thread", thread_status)):
         hits = [e for e in window if f"uncaught boom {tag}" in json.dumps(e)]
-        good = [e for e in hits if e.get("type") == "application" and e.get("level") in ("error", "critical", "alert", "emergency")]
+        good = [e for e in hits if e.get("type") == "exception" and e.get("level") == "error" and (e.get("data") or {}).get("trace")]
         # The request must still be answered: a 500 from the server, not a dropped connection (nginx 502).
         status_ok = code == 500 if name == "uncaught" else code == 200
         results[name] = (len(hits) == 1 and len(good) == 1 and status_ok,
@@ -121,7 +135,7 @@ def check(env: str, url: str, since: datetime | None) -> dict:
     results["request_id"] = (bool(request_id) and bool(ours) and not missing,
                              f"X-Request-ID={request_id!r}; mismatched: {missing}" if missing else f"{len(ours)} entries carry it")
 
-    plain = [e["message"] for e in noise_window if e.get("type") == "system"]
+    plain = [e["message"] for e in noise_window if e.get("type") == "system" and not PLATFORM.fullmatch(e["message"])]
     results["noise"] = (not plain, f"{len(plain)} plain line(s)")
     return {"env": env, "marker": marker, "results": results, "plain": plain}
 
