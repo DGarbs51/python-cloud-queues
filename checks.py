@@ -134,7 +134,8 @@ def web_port(headers) -> Result:
         return "pass", f"listening on [::]:{port}", ""
     if listeners:
         return "fail", f"listening on {', '.join(sorted(listeners))} port {port}, not [::]", (
-            "Cloud reaches apps over IPv6, so the server must listen on `::`. Use `--host ::` (uvicorn) or `--bind [::]:$PORT` (gunicorn).")
+            "Cloud's startup probes connect over IPv6 (nginx over 127.0.0.1), so the server must listen on dual-stack `::`. "
+            "Use `--host ::` (uvicorn) or `--bind [::]:$PORT` (gunicorn).")
     return "warn", f"nothing found listening on port {port}", "The server may be listening on a different port than PORT. Use `--port $PORT` in the start command."
 
 
