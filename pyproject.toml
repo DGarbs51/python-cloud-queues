@@ -4,12 +4,12 @@ version = "0.0.0"
 description = "Plain-Python app that checks whether Python works on a Laravel Cloud deployment."
 requires-python = ">=3.10"
 dependencies = [
-    "laravel-cloud-queues[redis]>=0.2.1",
+    "laravel-cloud-queues[redis]>=0.2.2",
     "pymysql",
     "certifi",
     "gunicorn",
     "uvicorn",
-    "laravel-cloud-logging>=0.2.1",
+    "laravel-cloud-logging>=0.2.3",
     "psycopg[binary]>=3.3.6",
     "websockets>=16.1.1",
     "granian>=2.8.4",
