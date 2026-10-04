@@ -34,8 +34,6 @@ EXPECTED_LEVELS = {"info": "info", "notice": "info", "warning": "warning", "erro
 assert set(EXPECTED_LEVELS) | {"debug"} == set(LOG_TEST_LEVELS)
 # Known, reported server behaviour for an uncaught exception in a request. Still exactly one error entry.
 KNOWN_UNCAUGHT = {
-    "server-granian-asgi": "Granian logs it as text, not an exception entry (laravel-cloud-python-logging#38)",
-    "server-granian-wsgi": "Granian logs it as text, not an exception entry (laravel-cloud-python-logging#38)",
     "server-uwsgi": "uWSGI closes the connection without a response, so nginx answers 502",
 }
 # Cloud's own supervisor lines (type=system on every runtime), not the app's or the server's.
