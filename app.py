@@ -16,12 +16,14 @@ import os
 import random
 import re
 import sys
+import threading
 import time
 import uuid
 from collections.abc import Mapping
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, urlsplit
 
+from laravel_cloud_logging import ALERT, EMERGENCY, NOTICE
 from laravel_cloud_queues import Registry, current_job
 
 import checks
@@ -40,6 +42,15 @@ MAX_BODY = 64 * 1024
 SERVER = "unknown"  # set by started()
 
 Response = tuple[int, list[tuple[str, str]], bytes]
+MARKER = re.compile(r"[A-Za-z0-9-]{1,64}")
+# /api/log-test levels. DEBUG is below the default LOG_LEVEL=INFO, so it must not reach Cloud.
+LOG_TEST_LEVELS = {"debug": logging.DEBUG, "info": logging.INFO, "notice": NOTICE, "warning": logging.WARNING,
+                   "error": logging.ERROR, "critical": logging.CRITICAL, "alert": ALERT, "emergency": EMERGENCY}
+LOG_TEST_UNICODE = "日本語 · émoji 🚀"
+
+
+class Boom(Exception):
+    """Raised by /api/boom past handle()'s catch-all, so the server's own error path has to log it."""
 
 
 @registry.job(name="demo.quick")
@@ -139,10 +150,12 @@ def handle(method: str, path: str, headers: Mapping[str, str], body: bytes) -> R
     started = time.monotonic()
     supplied = next((v for k, v in headers.items() if k.lower() == "x-request-id"), "")
     request_id = supplied if re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", supplied) else uuid.uuid4().hex
-    path = urlsplit(path).path
+    path, query = urlsplit(path).path, urlsplit(path).query
     with logs.context(request_id=request_id):
         try:
-            status, response_headers, payload = _handle(method, path, headers, body)
+            status, response_headers, payload = _handle(method, path, query, headers, body)
+        except Boom:
+            raise
         except Exception:
             log.exception("Request failed: %s %s", method, path)
             status, response_headers, payload = json_response(503, {"error": "service unavailable"})
@@ -155,7 +168,7 @@ def handle(method: str, path: str, headers: Mapping[str, str], body: bytes) -> R
     return status, [*response_headers, ("X-Request-ID", request_id)], payload
 
 
-def _handle(method: str, path: str, headers: Mapping[str, str], body: bytes) -> Response:
+def _handle(method: str, path: str, query: str, headers: Mapping[str, str], body: bytes) -> Response:
     if len(body) > MAX_BODY:
         return json_response(400, {"error": "body exceeds 64 KiB"})
     if method == "POST":
@@ -181,6 +194,19 @@ def _handle(method: str, path: str, headers: Mapping[str, str], body: bytes) -> 
             return json_response(200, checks.run(headers))
         if path.startswith("/api/throughput/"):
             return json_response(*throughput.status(path.removeprefix("/api/throughput/")))
+        if path in ("/api/log-test", "/api/boom", "/api/boom-thread"):
+            marker = next((v for k, v in parse_qsl(query) if k == "marker"), "")
+            if not MARKER.fullmatch(marker):
+                return json_response(400, {"error": "marker must be 1-64 letters, digits or -"})
+            if path == "/api/log-test":
+                log_test(marker)
+            elif path == "/api/boom":
+                _boom_outer(marker)
+            else:
+                thread = threading.Thread(target=_boom_outer, args=(marker,), name="boom-thread")
+                thread.start()
+                thread.join()
+            return json_response(200, {"ok": True, "marker": marker})
     elif method == "POST":
         if path == "/api/check":
             if not run_check():
@@ -192,6 +218,34 @@ def _handle(method: str, path: str, headers: Mapping[str, str], body: bytes) -> 
             telemetry.reset()
             return json_response(200, {"ok": True})
     return json_response(404, {"error": "not found"})
+
+
+def log_test(marker: str) -> None:
+    """One line per level, plus context, multi-line, non-English and a chained exception. Used by logs_check.py (#17)."""
+    for name, level in LOG_TEST_LEVELS.items():
+        log.log(level, "log-test %s", name, extra=dict(marker=marker, case=name))
+    log.info("log-test extra", extra=dict(marker=marker, case="extra", order={"id": 42, "items": ["a", "b"]}))
+    log.info("log-test multi-line\nsecond line\nthird line", extra=dict(marker=marker, case="multiline"))
+    log.info("log-test unicode %s", LOG_TEST_UNICODE, extra=dict(marker=marker, case="unicode"))
+    try:
+        try:
+            raise KeyError("inner cause")
+        except KeyError as exc:
+            raise ValueError("log-test outer") from exc
+    except ValueError:
+        log.exception("log-test exception", extra=dict(marker=marker, case="exception"))
+
+
+def _boom_outer(marker: str) -> None:
+    _boom_middle(marker)
+
+
+def _boom_middle(marker: str) -> None:
+    _boom_inner(marker)
+
+
+def _boom_inner(marker: str) -> None:
+    raise Boom(f"uncaught boom {marker}")
 
 
 def self_check() -> None:
@@ -214,6 +268,13 @@ def self_check() -> None:
     with patch(__name__ + ".run_check", return_value=False):
         assert handle("POST", "/api/check", {"Content-Type": "application/json"}, b"{}")[0] == 409
     assert handle("POST", "/api/dispatch/timeout", {"Content-Type": "application/json"}, b"{}")[0] == 404
+    assert handle("GET", "/api/log-test?marker=bad marker!", {}, b"")[0] == 400
+    assert handle("GET", "/api/log-test?marker=m-1", {}, b"")[0] == 200
+    try:
+        handle("GET", "/api/boom?marker=m-1", {}, b"")
+        raise AssertionError("/api/boom must escape handle()")
+    except Boom:
+        pass
     assert logs.CONTEXT.get() == {}
     print("Router contract checks passed")
 
