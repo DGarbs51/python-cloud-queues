@@ -107,6 +107,10 @@ def check(server: str) -> None:
     for marker in ("t-boom", "t-thread"):
         errors = [r for r in records if f"uncaught boom {marker}" in json.dumps(r) and r["level"] >= 400]
         assert len(errors) == 1, f"{server}: expected one ERROR-or-worse record for {marker}, saw {len(errors)}"
+        # Cloud only shows a structured exception when the record carries one. Granian logs uncaught request
+        # exceptions as a text traceback (laravel-cloud-python-logging#38).
+        text_only = server.startswith("granian") and marker == "t-boom"
+        assert ("exception" in errors[0]["context"]) != text_only, f"{server}: {marker} record: {errors[0]}"
     startups = {r["context"].get("pid") for r in records if r["message"] == "startup"}
     expected = 1 if server in SINGLE_PROCESS else 2
     assert len(startups) == expected, f"{server}: expected {expected} workers from WEB_CONCURRENCY, saw {startups}"
