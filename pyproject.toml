@@ -9,7 +9,7 @@ dependencies = [
     "certifi",
     "gunicorn",
     "uvicorn",
-    "laravel-cloud-logging>=0.2.3",
+    "laravel-cloud-logging>=0.3.0",
     "psycopg[binary]>=3.3.6",
     "websockets>=16.1.1",
     "granian>=2.8.4",
