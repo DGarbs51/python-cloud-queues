@@ -25,6 +25,8 @@ from urllib.parse import unquote, urlsplit
 
 import certifi
 
+import serve
+
 TIMEOUT = 5
 LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
 CLOUD_ONLY = "Only checked on Laravel Cloud."
@@ -95,7 +97,9 @@ def web_server(headers) -> Result:
                 "Cloud sets WEB_CONCURRENCY to match the instance size. Without it the server runs a single process.")
         return "pass", f"{app.SERVER}, 1 process (WEB_CONCURRENCY not set)", ""
     wanted = int(expected)
-    # Workers are the children of one parent (uvicorn or gunicorn master); a single process has no parent.
+    if app.SERVER in serve.SINGLE_PROCESS:
+        return "pass", f"{app.SERVER}, 1 process (it has no process count, so WEB_CONCURRENCY={wanted} does not apply)", ""
+    # Workers are the children of one parent (the server's master); a single process has no parent.
     count = _siblings(os.getppid()) if wanted > 1 else 1
     detail = f"{app.SERVER}, {count} process(es), WEB_CONCURRENCY={wanted}"
     if count == wanted:
@@ -164,7 +168,7 @@ def web_event_loop(headers) -> Result:
     seconds = LOOP_SECONDS.get()
     if seconds is None:
         return "skip", "Running under WSGI, so there is no event loop to test.", (
-            "This app is running on gunicorn (WSGI). Switch the start command to uvicorn to test async.")
+            "This app is running on a WSGI server. Switch to an ASGI server (see serve.py) to test async.")
     detail = f"50 concurrent 0.2 s sleeps finished in {seconds:.2f} s"
     if seconds < 0.5:
         return "pass", detail, ""
@@ -176,9 +180,9 @@ def web_websocket(headers) -> Result:
 
     if not on_cloud():
         return "skip", "Not on Laravel Cloud, so there is no proxy chain to test.", CLOUD_ONLY
-    if app.SERVER != "uvicorn":
+    if LOOP_SECONDS.get() is None:
         return "skip", f"Running on {app.SERVER} (WSGI), which has no WebSockets.", (
-            "Switch the start command to uvicorn to test WebSockets through Cloud's proxy.")
+            "Switch to an ASGI server (see serve.py) to test WebSockets through Cloud's proxy.")
     host = _header(headers, "host").split(":")[0]
     if not host:
         return "fail", "request has no Host header", FAIL_HELP

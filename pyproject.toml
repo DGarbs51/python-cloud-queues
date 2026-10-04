@@ -12,6 +12,11 @@ dependencies = [
     "laravel-cloud-logging>=0.2.1",
     "psycopg[binary]>=3.3.6",
     "websockets>=16.1.1",
+    "granian>=2.8.4",
+    "hypercorn>=0.18.0",
+    "daphne>=4.2.3",
+    "waitress>=3.0.2",
+    "pyuwsgi>=2.0.30.post1",
 ]
 
 [tool.uv]
