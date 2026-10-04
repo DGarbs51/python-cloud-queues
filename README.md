@@ -57,8 +57,11 @@ Every environment uses the same settings, so results compare across versions:
 - **Valkey cache** attached (Cloud injects `REDIS_URL`) and `LARAVEL_CLOUD_QUEUES_BACKEND=redis`.
 - **Database** (optional) attached; Cloud injects `DATABASE_URL`. Set `DB_SSL_VERIFY=0` for
   Cloud's self-signed database proxy.
-- Deploy command empty. Build command (temporary, see [cloud-bootstrap/](cloud-bootstrap/README.md)):
-  `if [ -d cloud-bootstrap ]; then mkdir -p "$(python -m site --user-site)" && cp cloud-bootstrap/laravel_cloud_bootstrap.py cloud-bootstrap/zz_laravel_cloud_bootstrap.pth "$(python -m site --user-site)/"; fi`
+- Deploy command empty. Build command: the `cloud-bootstrap` copy is temporary (see
+  [cloud-bootstrap/](cloud-bootstrap/README.md)); `laravel-cloud-logging-config logging.json`
+  writes the logging config uvicorn, granian and hypercorn read with `--log-config`, so their
+  main-process lines are JSON too. `serve.py` won't start those servers without it.
+  `if [ -d cloud-bootstrap ]; then mkdir -p "$(python -m site --user-site)" && cp cloud-bootstrap/laravel_cloud_bootstrap.py cloud-bootstrap/zz_laravel_cloud_bootstrap.pth "$(python -m site --user-site)/"; fi && laravel-cloud-logging-config logging.json`
 
 The server must accept both IPv6 and IPv4 on `$PORT`: Cloud's startup probes connect over IPv6,
 while the pod's nginx currently connects to `127.0.0.1`. `[::]` is dual-stack for most servers;
@@ -117,6 +120,7 @@ uv run python app.py --self-check              # router and logging
 uv run --env-file .env python test_checks.py   # check contract
 uv run --env-file .env python test_throughput.py
 uv run python test_servers.py [server ...]     # boots every server in serve.py the way Cloud does
+uv run python logs_check.py [env ...]          # on Cloud: levels, exceptions, request IDs, plain lines (#17)
 ```
 
 ## Files
