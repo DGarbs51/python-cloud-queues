@@ -35,8 +35,8 @@ def free_port() -> int:
         return sock.getsockname()[1]
 
 
-def request(port, method, path, body=b"", headers=None):
-    conn = http.client.HTTPConnection("::1", port, timeout=10)
+def request(port, method, path, body=b"", headers=None, host="::1"):
+    conn = http.client.HTTPConnection(host, port, timeout=10)
     try:
         conn.request(method, path, body=body, headers=headers or {},
                      encode_chunked=(headers or {}).get("Transfer-Encoding") == "chunked")
@@ -67,6 +67,8 @@ def check(server: str) -> None:
             status, headers, body = request(port, "GET", "/api/ping", headers={"Cloud-Request-ID": "cr-test"})
             assert (status, json.loads(body)) == (200, {"ok": True}) and headers.get("x-request-id")
             assert request(port, "GET", "/")[0] == 200
+            # Cloud's nginx connects to 127.0.0.1, so [::] must not be IPv6-only.
+            assert request(port, "GET", "/api/ping", host="127.0.0.1")[0] == 200, f"{server} unreachable over IPv4"
             assert request(port, "GET", "/nope")[0] == 404
             assert request(port, "POST", "/api/check", b"{}", {"Content-Type": "text/plain"})[0] == 415
             # Chunked bodies (no Content-Length) get the same JSON checks as sized ones.

@@ -19,7 +19,8 @@ COMMANDS = {
     # --lazy-apps: import the app in each worker, not once in the master before forking.
     "uwsgi": "uwsgi --http-socket [::]:{port} --module wsgi:app --master --processes {workers} --lazy-apps "
              "--enable-threads --die-on-term --need-app --disable-logging",
-    "waitress": "waitress-serve --listen=[::]:{port} wsgi:app",
+    # waitress sets IPV6_V6ONLY on [::], and the pod's nginx connects over 127.0.0.1: listen on both.
+    "waitress": "waitress-serve --listen=[::]:{port} --listen=0.0.0.0:{port} wsgi:app",
     "granian-wsgi": "granian --interface wsgi --host :: --port {port} --workers {workers} wsgi:app",
     "granian-asgi": "granian --interface asgi --host :: --port {port} --workers {workers} asgi:app",
     "hypercorn-wsgi": "hypercorn --bind [::]:{port} --workers {workers} wsgi:app",
