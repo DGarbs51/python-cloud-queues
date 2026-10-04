@@ -1,8 +1,9 @@
-"""ASGI entrypoint: uvicorn asgi:app --host :: --port $PORT"""
+"""ASGI entrypoint: uvicorn asgi:app --host :: --port $PORT (other ASGI servers: see serve.py)"""
 
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 
 from laravel_cloud_logging import asgi_middleware
@@ -10,7 +11,7 @@ from laravel_cloud_logging import asgi_middleware
 import app as app_module
 import checks
 
-app_module.started("uvicorn")
+app_module.started(os.environ.get("WEB_SERVER", "uvicorn"))
 
 
 async def app(scope: dict, receive, send) -> None:

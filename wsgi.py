@@ -1,15 +1,19 @@
-"""WSGI entrypoint: gunicorn wsgi:app --bind [::]:$PORT (settings in gunicorn.conf.py)."""
+"""WSGI entrypoint: gunicorn wsgi:app --bind [::]:$PORT (settings in gunicorn.conf.py).
+
+Other WSGI servers: see serve.py.
+"""
 
 from __future__ import annotations
 
 import http.client
+import os
 
 from laravel_cloud_logging import wsgi_middleware
 
 import app as app_module
 import checks
 
-app_module.started("gunicorn")
+app_module.started(os.environ.get("WEB_SERVER", "gunicorn"))
 
 
 def app(environ: dict, start_response):
@@ -17,10 +21,13 @@ def app(environ: dict, start_response):
         length = int(environ.get("CONTENT_LENGTH") or 0)
     except ValueError:
         length = -1
-    if not environ.get("CONTENT_LENGTH") and environ.get("wsgi.input_terminated"):
+    chunked = "chunked" in environ.get("HTTP_TRANSFER_ENCODING", "").lower()
+    if not environ.get("CONTENT_LENGTH") and (environ.get("wsgi.input_terminated") or chunked):
         # Chunked body: no length up front, so read one byte past the cap to detect oversize.
+        # gunicorn sets wsgi.input_terminated; hypercorn buffers the body without saying so.
         body = environ["wsgi.input"].read(app_module.MAX_BODY + 1)
-        length = len(body)
+        # uWSGI can't de-chunk into wsgi.input and reads b"": reject rather than treat it as empty.
+        length = len(body) if body or not chunked else -1
     else:
         body = None
     if not 0 <= length <= app_module.MAX_BODY:

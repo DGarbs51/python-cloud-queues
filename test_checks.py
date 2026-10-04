@@ -44,7 +44,7 @@ def main() -> None:
     # Never raises: the stubbed network call becomes a fail row carrying the exception class.
     assert rows["runtime.https"]["status"] == "fail" and rows["runtime.https"]["detail"].startswith("OSError")
     # WSGI path (LOOP_SECONDS unset) reports the async check as skipped with the fixed help text.
-    assert rows["web.event_loop"]["status"] == "skip" and "Switch the start command to uvicorn" in rows["web.event_loop"]["help"]
+    assert rows["web.event_loop"]["status"] == "skip" and "Switch to an ASGI server" in rows["web.event_loop"]["help"]
     assert rows["runtime.tmp"]["status"] == rows["runtime.subprocess"]["status"] == rows["runtime.threads"]["status"] == "pass"
     assert rows["web.proto"]["status"] == "skip"  # off Cloud
 
@@ -149,11 +149,9 @@ def main() -> None:
             assert status == "pass" and "sysconf reports 4096 MiB" in detail, detail
 
     # WebSocket check: skipped off Cloud and under WSGI; on Cloud a 101 with the right accept key passes.
-    import app as app_module
     assert checks.web_websocket({"host": "x"})[0] == "skip"  # LARAVEL_CLOUD unset
     with patch.dict(os.environ, LARAVEL_CLOUD="1"):
-        with patch.object(app_module, "SERVER", "gunicorn"):
-            assert checks.web_websocket({"host": "x"})[0] == "skip"
+        assert checks.web_websocket({"host": "x"})[0] == "skip"  # LOOP_SECONDS unset: WSGI
 
         class FakeSock:
             def __init__(self, reply):
@@ -172,11 +170,13 @@ def main() -> None:
         key = base64.b64encode(b"k" * 16).decode()
         accept = base64.b64encode(hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest())
         upgraded = b"HTTP/1.1 101 Switching Protocols\r\nSec-WebSocket-Accept: " + accept + b"\r\n\r\n"
+        asgi = checks.LOOP_SECONDS.set(0.2)  # what asgi.py sets under any ASGI server
         for reply, expected in ((upgraded, "pass"), (b"HTTP/1.1 404 Not Found\r\n\r\n", "fail")):
-            with patch.object(app_module, "SERVER", "uvicorn"), patch("os.urandom", return_value=b"k" * 16), \
+            with patch("os.urandom", return_value=b"k" * 16), \
                     patch("socket.create_connection", return_value=FakeSock(reply)), \
                     patch("ssl.create_default_context", return_value=FakeSock(b"")):
                 assert checks.web_websocket({"Host": "app.example"})[0] == expected
+        checks.LOOP_SECONDS.reset(asgi)
 
         # IPv6 upstream: ::1 passes, 127.0.0.1 warns.
         for peer, expected in (("::1", "pass"), ("127.0.0.1", "warn"), ("::ffff:127.0.0.1", "warn"), ("10.0.0.9", "warn")):
