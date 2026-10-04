@@ -11,8 +11,8 @@ import os
 import sys
 from pathlib import Path
 
-# Bind [::]:$PORT so Cloud's IPv6 proxy can reach the app. uvicorn and gunicorn read WEB_CONCURRENCY
-# themselves; the others get it as a flag. waitress (threads) and daphne have no process count.
+# Bind [::]:$PORT, dual-stack: Cloud's startup probes connect over IPv6, the pod's nginx over 127.0.0.1.
+# uvicorn and gunicorn read WEB_CONCURRENCY themselves; the others get it as a flag. waitress (threads) and daphne have no process count.
 COMMANDS = {
     "uvicorn": "uvicorn asgi:app --host :: --port {port}",
     "gunicorn": "gunicorn wsgi:app --bind [::]:{port}",
