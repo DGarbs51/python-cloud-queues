@@ -13,8 +13,10 @@ from pathlib import Path
 
 # Bind [::]:$PORT, dual-stack: Cloud's startup probes connect over IPv6, the pod's nginx over 127.0.0.1.
 # uvicorn and gunicorn read WEB_CONCURRENCY themselves; the others get it as a flag. waitress (threads) and daphne have no process count.
+# Logging flags follow laravel-cloud-logging's server table. logging.json is written by the Cloud build command
+# `laravel-cloud-logging-config logging.json`, so main-process lines (boot, workers, shutdown) are JSON too.
 COMMANDS = {
-    "uvicorn": "uvicorn asgi:app --host :: --port {port}",
+    "uvicorn": "uvicorn asgi:app --host :: --port {port} --log-config logging.json",
     "gunicorn": "gunicorn wsgi:app --bind [::]:{port}",
     # --lazy-apps: import the app in each worker, not once in the master before forking.
     "uwsgi": "uwsgi --http-socket [::]:{port} --module wsgi:app --master --processes {workers} --lazy-apps "
@@ -22,11 +24,13 @@ COMMANDS = {
     # waitress sets IPV6_V6ONLY on [::], and the pod's nginx connects over 127.0.0.1: listen on both.
     # It also deletes X-Forwarded-* from untrusted proxies; keep them, as the other servers do.
     "waitress": "waitress-serve --listen=[::]:{port} --listen=0.0.0.0:{port} --no-clear-untrusted-proxy-headers wsgi:app",
-    "granian-wsgi": "granian --interface wsgi --host :: --port {port} --workers {workers} wsgi:app",
-    "granian-asgi": "granian --interface asgi --host :: --port {port} --workers {workers} asgi:app",
-    "hypercorn-wsgi": "hypercorn --bind [::]:{port} --workers {workers} wsgi:app",
-    "hypercorn-asgi": "hypercorn --bind [::]:{port} --workers {workers} asgi:app",
-    "daphne": "daphne --bind :: --port {port} asgi:app",
+    "granian-wsgi": "granian --interface wsgi --host :: --port {port} --workers {workers} --log-config logging.json wsgi:app",
+    "granian-asgi": "granian --interface asgi --host :: --port {port} --workers {workers} --log-config logging.json asgi:app",
+    # json: prefix, or hypercorn reads the file as INI.
+    "hypercorn-wsgi": "hypercorn --bind [::]:{port} --workers {workers} --log-config json:logging.json wsgi:app",
+    "hypercorn-asgi": "hypercorn --bind [::]:{port} --workers {workers} --log-config json:logging.json asgi:app",
+    # -v 0: daphne prints its access log straight to stdout; Cloud's nginx already logs each request.
+    "daphne": "daphne -v 0 --bind :: --port {port} asgi:app",
 }
 SINGLE_PROCESS = {"waitress", "daphne"}
 
