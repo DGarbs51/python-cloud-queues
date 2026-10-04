@@ -60,8 +60,11 @@ Every environment uses the same settings, so results compare across versions:
 - Deploy command empty. Build command (temporary, see [cloud-bootstrap/](cloud-bootstrap/README.md)):
   `if [ -d cloud-bootstrap ]; then mkdir -p "$(python -m site --user-site)" && cp cloud-bootstrap/laravel_cloud_bootstrap.py cloud-bootstrap/zz_laravel_cloud_bootstrap.pth "$(python -m site --user-site)/"; fi`
 
-Use `--host ::`, not `--host ''`: with several workers uvicorn binds an IPv4-only socket for
-`''`, which Cloud's IPv6 network can't reach.
+The server must accept both IPv6 and IPv4 on `$PORT`: Cloud's startup probes connect over IPv6,
+while the pod's nginx currently connects to `127.0.0.1`. `[::]` is dual-stack for most servers;
+waitress makes it IPv6-only, so `serve.py` also gives it `0.0.0.0`. Use `--host ::`, not
+`--host ''`: with several workers uvicorn binds an IPv4-only socket for `''`, which the probes
+can't reach.
 
 The page header shows which server answered. Under WSGI servers the async and WebSocket rows
 are skipped. waitress (threads) and daphne have no process count, so they run one process
