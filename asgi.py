@@ -30,8 +30,16 @@ async def app(scope: dict, receive, send) -> None:
         return
     # The address nginx connected from: ::1 when it reaches the app over IPv6, 127.0.0.1 over IPv4.
     checks.PEER.set((scope.get("client") or ("",))[0])
-    body, too_large = b"", False
-    while True:
+    body, too_large, uploaded = b"", False, None
+    if scope["method"] == "POST" and scope["path"] == "/api/upload":
+        # Count the body without keeping it, so a big upload can't push the worker out of memory (#10).
+        uploaded = 0
+        while uploaded <= app_module.UPLOAD_MAX:
+            message = await receive()
+            uploaded += len(message.get("body", b""))
+            if not message.get("more_body"):
+                break
+    while uploaded is None:
         message = await receive()
         body += message.get("body", b"")
         if len(body) > app_module.MAX_BODY:
@@ -50,7 +58,8 @@ async def app(scope: dict, receive, send) -> None:
             await asyncio.gather(*(asyncio.sleep(0.2) for _ in range(50)))
             checks.LOOP_SECONDS.set(time.monotonic() - started)
         # handle() is synchronous (Redis); run it off the event loop so slow routes never stall others.
-        status, headers, payload = await asyncio.to_thread(app_module.handle, scope["method"], path, headers, body)
+        status, headers, payload = await asyncio.to_thread(app_module.handle, scope["method"], path, headers, body,
+                                                           uploaded)
     await send({"type": "http.response.start", "status": status,
                 "headers": [(k.lower().encode("latin-1"), v.encode("latin-1")) for k, v in headers]})
     await send({"type": "http.response.body", "body": payload})
