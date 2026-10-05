@@ -248,7 +248,7 @@ def main() -> None:
             if name in override:
                 return override[name]
             if name in checks.STATIC:
-                cache = {"cache-control": checks.STATIC[name]} if checks.STATIC[name] else {}
+                cache = {"cache-control": checks.static_cache(name)} if checks.static_cache(name) else {}
                 return 200, cache, (checks.PUBLIC / name).read_bytes()
             if name in checks.STATIC_BLOCKED:
                 return 403, {}, b"<html>403 Forbidden</html>"
@@ -263,6 +263,14 @@ def main() -> None:
                 status, detail, _ = checks.web_static({"host": "app.example"})
                 assert status == expected, (override, detail)
                 assert expected == "pass" or next(iter(override)) in detail, detail
+    # Types without a fixed value get the operator's NGINX_CACHE_DEFAULT, or no header when it is unset.
+    for env, sent, expected in (("no-cache, private", "no-cache, private", "pass"), ("no-cache, private", None, "warn"),
+                                ("", None, "pass"), ("", "no-cache, private", "warn")):
+        with patch.dict(os.environ, LARAVEL_CLOUD="1", NGINX_CACHE_DEFAULT=env):
+            robots = (200, {"cache-control": sent} if sent else {}, (checks.PUBLIC / "robots.txt").read_bytes())
+            with patch.object(checks, "_get", answers(**{"robots.txt": robots})):
+                status, detail, _ = checks.web_static({"host": "app.example"})
+                assert status == expected, (env, sent, detail)
 
     # Latest patch and end of life (#12), from endoflife.date.
     import io
