@@ -59,7 +59,7 @@ def self_check():
     assert [f.role for f in root[0].filters if isinstance(f, ContextFilter)] == ["worker"]
     record = LOGGER.makeRecord(LOGGER.name, logging.INFO, __file__, 1, "x", (), None, extra={"run": "extra"})
     with context(run="context", job="demo"):
-        root[0].filters[0].filter(record)
+        next(f for f in root[0].filters if isinstance(f, ContextFilter)).filter(record)
     assert (record.role, record.run, record.job) == ("worker", "extra", "demo")
     assert CONTEXT.get() == {}
     setup("web")
