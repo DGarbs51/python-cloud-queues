@@ -291,12 +291,9 @@ def web_streaming(headers) -> Result:
         (plain, plain_detail), (opted, opted_detail) = pool.map(
             lambda path: _streamed(_arrivals(host, path)), ("/api/stream", "/api/stream?accel=no"))
     detail = f"default: {plain_detail}; with X-Accel-Buffering: no: {opted_detail}"
-    if plain:
+    # The documented opt-out is what apps rely on; buffering without it (uWSGI's --http-socket, SE-303) is expected.
+    if plain or opted:
         return "pass", detail, ""
-    if opted:
-        return "warn", detail, (
-            "Cloud's nginx buffers responses, so streamed ones (server-sent events, AI chat, progress) arrive in one piece "
-            "unless the response sends the header X-Accel-Buffering: no. Send it on every streaming response.")
     return "fail", detail, (
         "Something between the browser and the app buffers streamed responses even with X-Accel-Buffering: no, "
         "so server-sent events and AI chat look frozen and then arrive all at once.")
@@ -424,6 +421,9 @@ def log_socket(headers) -> Result:
 # Runtime
 
 
+PATCH_LAG_DAYS = 30
+
+
 def python_version(headers) -> Result:
     running = f"{sys.version_info.major}.{sys.version_info.minor}"
     detail = f"running Python {sys.version.split()[0]}"
@@ -441,18 +441,21 @@ def python_version(headers) -> Result:
             cycle = json.load(response)
     except Exception as exc:
         return "pass", f"{detail}; latest-patch comparison skipped ({type(exc).__name__})", ""
-    latest, problems = cycle["latest"], []
+    latest, notes, problems = cycle["latest"], [], []
     behind = int(latest.split(".")[2]) - sys.version_info.micro
     if behind > 0:
         days = (date.today() - date.fromisoformat(cycle["latestReleaseDate"])).days
-        problems.append(f"latest is {latest} ({behind} release(s) behind; {latest} released {days} days ago)")
+        # A patch arrives with the next base-image bump; only a lag past PATCH_LAG_DAYS means the bumps have stalled.
+        (problems if days > PATCH_LAG_DAYS else notes).append(
+            f"latest is {latest} ({behind} release(s) behind; {latest} released {days} days ago)")
     if isinstance(cycle.get("eol"), str) and date.fromisoformat(cycle["eol"]) <= date.today():
         problems.append(f"Python {running} reached end of life on {cycle['eol']}")
     if problems:
-        return "warn", f"{detail}; " + "; ".join(problems), (
-            "Cloud's Python comes from its base image, so a patch release arrives with the next base-image release, and "
-            ".python-version can't pin one (Cloud reads only major.minor). Past end of life there are no security fixes.")
-    return "pass", f"{detail} (latest {running})", ""
+        return "warn", f"{detail}; " + "; ".join(problems + notes), (
+            f"Cloud's Python comes from its base image, so a patch release arrives with the next base-image bump, and "
+            f".python-version can't pin one (Cloud reads only major.minor). Behind by more than {PATCH_LAG_DAYS} days means "
+            "the bumps have stalled. Past end of life there are no security fixes.")
+    return "pass", f"{detail}; " + "; ".join(notes) if notes else f"{detail} (latest {running})", ""
 
 
 def outbound_https(headers) -> Result:
