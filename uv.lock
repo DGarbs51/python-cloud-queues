@@ -674,11 +674,11 @@ wheels = [
 
 [[package]]
 name = "laravel-cloud-logging"
-version = "0.3.0"
+version = "0.3.1"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/e8/a6/28f2379ac6364a6559ee4bfee4cbd0bb4b5b7425ab88de022785c6dddad9/laravel_cloud_logging-0.3.0.tar.gz", hash = "sha256:2c3badb924dcc043342a429c749534eaed05ea25f6fdc40cbcdba87777d8c655", size = 18862, upload-time = "2026-10-04T16:22:36.408Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/5e/75/69932f42e2202cc17829ef4647fe9315c9829cbedd583c5198e9920f08c4/laravel_cloud_logging-0.3.1.tar.gz", hash = "sha256:6762b2290f1b1b03652a33f51899fb17c9e466248bc094eaf0cd5775994e2083", size = 20064, upload-time = "2026-10-05T00:08:54.906Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/c1/b2/d16952d70f82d6eeb4e574717362aad31f5568cbfb7f93fcf250223c6d1d/laravel_cloud_logging-0.3.0-py3-none-any.whl", hash = "sha256:2005040386b0a669b75ae0e6eaa63f040182d30c1cb256d09fc6ee4be5e4186d", size = 21615, upload-time = "2026-10-04T16:22:34.921Z" },
+    { url = "https://files.pythonhosted.org/packages/9e/d6/d9870e9488929f1d8943c469f587ba6defafefe1c167091232f5420f1a26/laravel_cloud_logging-0.3.1-py3-none-any.whl", hash = "sha256:26c97056437f73e451794e78a8c02985173c5f7e9b610ba459045f80faa68ecc", size = 22849, upload-time = "2026-10-05T00:08:53.231Z" },
 ]
 
 [[package]]
@@ -969,7 +969,7 @@ requires-dist = [
     { name = "granian", specifier = ">=2.8.4" },
     { name = "gunicorn" },
     { name = "hypercorn", specifier = ">=0.18.0" },
-    { name = "laravel-cloud-logging", specifier = ">=0.3.0" },
+    { name = "laravel-cloud-logging", specifier = "==0.3.1" },
     { name = "laravel-cloud-queues", extras = ["redis"], specifier = ">=0.2.2" },
     { name = "psycopg", extras = ["binary"], specifier = ">=3.3.6" },
     { name = "pymysql" },
