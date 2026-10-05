@@ -3,6 +3,11 @@
 Each check is a small function returning (status, detail, help); CHECKS lists them in display order.
 run() never raises: a check that throws becomes a fail row, every detail is scrubbed of credentials,
 and the checks run in parallel daemon threads under a 12 s deadline.
+
+CHECKS is the one registry the page, /api/checks and cloud_suite.py share (#19). Each entry has
+applies(server, python), false where the check doesn't fit (the row is a skip with the reason), and a tier:
+quick runs here on every request; full needs the Cloud CLI, so cloud_suite.py runs it and posts the result
+back, and the row shows that.
 """
 
 from __future__ import annotations
@@ -10,6 +15,7 @@ from __future__ import annotations
 import base64
 import contextvars
 import hashlib
+import json
 import os
 import re
 import socket
@@ -20,6 +26,7 @@ import tempfile
 import threading
 import time
 import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
@@ -34,6 +41,7 @@ CLOUD_ONLY = "Only checked on Laravel Cloud."
 LOOP_SECONDS: contextvars.ContextVar[float | None] = contextvars.ContextVar("loop_seconds", default=None)
 # asgi.py / wsgi.py set this to the address the request came from: nginx's side of the upstream connection.
 PEER: contextvars.ContextVar[str] = contextvars.ContextVar("peer", default="")
+SUITE_KEY = "lcq-demo:suite:"  # + check id: the latest cloud_suite.py result for a full-tier row
 USERINFO = re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://)[^\s/@]*@")
 
 Result = tuple[str, str, str]
@@ -167,9 +175,6 @@ def _proxy_header(name: str, expected: str | None = None):
 
 def web_event_loop(headers) -> Result:
     seconds = LOOP_SECONDS.get()
-    if seconds is None:
-        return "skip", "Running under WSGI, so there is no event loop to test.", (
-            "This app is running on a WSGI server. Switch to an ASGI server (see serve.py) to test async.")
     detail = f"50 concurrent 0.2 s sleeps finished in {seconds:.2f} s"
     if seconds < 0.5:
         return "pass", detail, ""
@@ -177,13 +182,8 @@ def web_event_loop(headers) -> Result:
 
 
 def web_websocket(headers) -> Result:
-    import app
-
     if not on_cloud():
         return "skip", "Not on Laravel Cloud, so there is no proxy chain to test.", CLOUD_ONLY
-    if LOOP_SECONDS.get() is None:
-        return "skip", f"Running on {app.SERVER} (WSGI), which has no WebSockets.", (
-            "Switch to an ASGI server (see serve.py) to test WebSockets through Cloud's proxy.")
     host = _header(headers, "host").split(":")[0]
     if not host:
         return "fail", "request has no Host header", FAIL_HELP
@@ -416,36 +416,91 @@ def dns_hosts(headers) -> Result:
     return "fail", detail, "The app cannot look up the hostname of an attached service, so it cannot connect to it. Check the service is attached to this environment."
 
 
+# Suite results (full tier)
+
+
+def suite_result(id: str) -> Result:
+    """The latest result cloud_suite.py posted for a full-tier row."""
+    client = _redis()
+    saved = client.get(SUITE_KEY + id) if client is not None else None
+    if not saved:
+        return "skip", "run `cloud_suite.py --tier full`", (
+            "This check needs the Cloud CLI, so cloud_suite.py runs it from outside the app and posts the result here.")
+    row = json.loads(saved)
+    return row["status"], f"{row['detail']} (cloud_suite.py, {row['at']})", (
+        "Run `uv run python cloud_suite.py --tier full <environment>` for the full report.")
+
+
+def save_suite(data: dict) -> tuple[int, dict]:
+    """POST /api/suite-results: {check id: {"status", "detail"}} for full-tier rows, from cloud_suite.py."""
+    full = {entry[1] for entry in CHECKS if entry[5] == "full"}
+    if not data or not all(id in full and isinstance(row, dict) and row.get("status") in ("pass", "warn", "fail", "skip")
+                           and isinstance(row.get("detail"), str) for id, row in data.items()):
+        return 400, {"error": f"expected {{check id: {{status, detail}}}} for {', '.join(sorted(full))}"}
+    client = _redis()
+    if client is None:
+        return 503, {"error": "REDIS_URL is not set"}
+    at = f"{datetime.now(timezone.utc):%Y-%m-%d %H:%M} UTC"
+    for id, row in data.items():
+        client.set(SUITE_KEY + id, json.dumps({"status": row["status"], "detail": row["detail"][:300], "at": at}))
+    return 200, {"ok": True}
+
+
+# Where a check applies. The docstring is the skip reason.
+
+
+def everywhere(server: str, python: str) -> bool:
+    return True
+
+
+def asgi_only(server: str, python: str) -> bool:
+    """WSGI servers have no event loop or WebSockets."""
+    return server in serve.ASGI
+
+
 FAIL_HELP = "The check could not complete. See the detail for the error, then check the network and service settings of this environment."
 
-CHECKS = [
-    ("Web", "web.server", "Server and processes", web_server),
-    ("Web", "web.port", "Listening port", web_port),
-    ("Web", "web.proto", "Proxy sends X-Forwarded-Proto: https", _proxy_header("X-Forwarded-Proto", "https")),
-    ("Web", "web.forwarded_for", "Proxy sends X-Forwarded-For", _proxy_header("X-Forwarded-For")),
-    ("Web", "web.request_id", "Proxy sends Cloud-Request-ID", _proxy_header("Cloud-Request-ID")),
-    ("Web", "web.event_loop", "Async event loop not blocked", web_event_loop),
-    ("Web", "web.websocket", "WebSocket upgrade through Cloud's proxy", web_websocket),
-    ("Web", "web.upstream_ipv6", "nginx reaches the app over IPv6", web_upstream_ipv6),
-    ("Logging", "logging.handler", "Cloud logging handler installed", log_handler),
-    ("Logging", "logging.socket", "Cloud log socket reachable", log_socket),
-    ("Runtime", "runtime.python", "Python version matches .python-version", python_version),
-    ("Runtime", "runtime.https", "Outbound HTTPS", outbound_https),
-    ("Runtime", "runtime.tmp", "/tmp writable", tmp_writable),
-    ("Runtime", "runtime.cpu", "CPU limit", cpu_limit),
-    ("Runtime", "runtime.memory", "Memory limit", memory_limit),
-    ("Runtime", "runtime.subprocess", "Subprocess", subprocess_run),
-    ("Runtime", "runtime.threads", "Threads", threads_run),
-    ("Services", "services.redis", "Valkey / Redis", redis_ping),
-    ("Services", "services.database", "Database", database_query),
-    ("Services", "services.dns", "DNS for service hosts", dns_hosts),
+CHECKS = [  # (group, id, title, fn, applies, tier); full-tier rows have no fn here: their job is in cloud_suite.JOBS
+    ("Web", "web.server", "Server and processes", web_server, everywhere, "quick"),
+    ("Web", "web.port", "Listening port", web_port, everywhere, "quick"),
+    ("Web", "web.proto", "Proxy sends X-Forwarded-Proto: https", _proxy_header("X-Forwarded-Proto", "https"), everywhere, "quick"),
+    ("Web", "web.forwarded_for", "Proxy sends X-Forwarded-For", _proxy_header("X-Forwarded-For"), everywhere, "quick"),
+    ("Web", "web.request_id", "Proxy sends Cloud-Request-ID", _proxy_header("Cloud-Request-ID"), everywhere, "quick"),
+    ("Web", "web.event_loop", "Async event loop not blocked", web_event_loop, asgi_only, "quick"),
+    ("Web", "web.websocket", "WebSocket upgrade through Cloud's proxy", web_websocket, asgi_only, "quick"),
+    ("Web", "web.upstream_ipv6", "nginx reaches the app over IPv6", web_upstream_ipv6, everywhere, "quick"),
+    ("Logging", "logging.handler", "Cloud logging handler installed", log_handler, everywhere, "quick"),
+    ("Logging", "logging.socket", "Cloud log socket reachable", log_socket, everywhere, "quick"),
+    ("Logging", "logging.cloud_viewer", "Logs render in Cloud's log viewer", None, everywhere, "full"),
+    ("Runtime", "runtime.python", "Python version matches .python-version", python_version, everywhere, "quick"),
+    ("Runtime", "runtime.https", "Outbound HTTPS", outbound_https, everywhere, "quick"),
+    ("Runtime", "runtime.tmp", "/tmp writable", tmp_writable, everywhere, "quick"),
+    ("Runtime", "runtime.cpu", "CPU limit", cpu_limit, everywhere, "quick"),
+    ("Runtime", "runtime.memory", "Memory limit", memory_limit, everywhere, "quick"),
+    ("Runtime", "runtime.subprocess", "Subprocess", subprocess_run, everywhere, "quick"),
+    ("Runtime", "runtime.threads", "Threads", threads_run, everywhere, "quick"),
+    ("Services", "services.redis", "Valkey / Redis", redis_ping, everywhere, "quick"),
+    ("Services", "services.database", "Database", database_query, everywhere, "quick"),
+    ("Services", "services.dns", "DNS for service hosts", dns_hosts, everywhere, "quick"),
 ]
 
 
+def python_minor() -> str:
+    return f"{sys.version_info.major}.{sys.version_info.minor}"
+
+
 def _one(entry, headers) -> dict[str, str]:
-    _, id, label, fn = entry
+    import app
+
+    _, id, label, fn, applies, tier = entry
     try:
-        status, detail, help = fn(headers)
+        if not applies(app.SERVER, python_minor()):
+            status, detail, help = "skip", f"Not run on {app.SERVER}: {applies.__doc__}", (
+                "This check doesn't apply to this environment's server or Python version.")
+        elif tier == "full":
+            status, detail, help = suite_result(id)
+        else:
+            status, detail, help = fn(headers)
     except Exception as exc:
         status, detail, help = "fail", f"{type(exc).__name__}: {exc}", FAIL_HELP
     return {"id": id, "label": label, "status": status, "detail": _scrub(detail)[:300], "help": help}
@@ -484,7 +539,7 @@ def run(headers) -> dict:
     for thread in threads:
         thread.join(max(0, deadline - time.monotonic()))
     rows = []
-    for _, id, label, _fn in CHECKS:
+    for _, id, label, *_ in CHECKS:
         if id in results:
             rows.append(results[id])
         elif id in busy:
