@@ -208,6 +208,12 @@ def main() -> None:
             assert checks.web_upstream_ipv6({})[0] == expected, peer
         checks.PEER.set("::ffff:127.0.0.1")
         assert "over IPv4 (127.0.0.1)" in checks.web_upstream_ipv6({})[1]
+        # uvicorn rewrites the peer to X-Real-IP's client only when nginx came from trusted ::1.
+        for server, expected in (("uvicorn", "pass"), ("granian-asgi", "warn")):
+            with patch.object(app, "SERVER", server):
+                checks.PEER.set("2600:1f16::2c")
+                assert checks.web_upstream_ipv6({"x-real-ip": "2600:1f16::2c"})[0] == expected, server
+                assert checks.web_upstream_ipv6({"x-real-ip": "2600:1f16::99"})[0] == "warn", server
         checks.PEER.set("")
     assert checks.web_upstream_ipv6({})[0] == "skip"
 
