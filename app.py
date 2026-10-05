@@ -47,6 +47,7 @@ MARKER = re.compile(r"[A-Za-z0-9-]{1,64}")
 LOG_TEST_LEVELS = {"debug": logging.DEBUG, "info": logging.INFO, "notice": NOTICE, "warning": logging.WARNING,
                    "error": logging.ERROR, "critical": logging.CRITICAL, "alert": ALERT, "emergency": EMERGENCY}
 LOG_TEST_UNICODE = "日本語 · émoji 🚀"
+STREAM_CHUNKS = 6  # /api/stream sends one a second; web.streaming times when each arrives (#8)
 
 
 class Boom(Exception):
@@ -192,6 +193,8 @@ def _handle(method: str, path: str, query: str, headers: Mapping[str, str], body
             return json_response(200, {**telemetry.snapshot(), "server": SERVER})
         if path == "/api/checks":
             return json_response(200, checks.run(headers))
+        if path == "/api/packages":
+            return json_response(200, checks.inventory())
         if path.startswith("/api/throughput/"):
             return json_response(*throughput.status(path.removeprefix("/api/throughput/")))
         if path in ("/api/log-test", "/api/boom", "/api/boom-thread"):
@@ -220,6 +223,18 @@ def _handle(method: str, path: str, query: str, headers: Mapping[str, str], body
             telemetry.reset()
             return json_response(200, {"ok": True})
     return json_response(404, {"error": "not found"})
+
+
+def stream_headers(query: str) -> list[tuple[str, str]]:
+    """GET /api/stream: server-sent events, no Content-Length. ?accel=no adds nginx's per-response buffering opt-out."""
+    headers = [("Content-Type", "text/event-stream")]
+    if ("accel", "no") in parse_qsl(query):
+        headers.append(("X-Accel-Buffering", "no"))
+    return headers
+
+
+def stream_chunk(i: int) -> bytes:
+    return f"data: {json.dumps(dict(i=i, sent=round(time.time(), 3)))}\n\n".encode()
 
 
 def log_test(marker: str) -> None:
