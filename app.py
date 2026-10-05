@@ -214,6 +214,8 @@ def _handle(method: str, path: str, query: str, headers: Mapping[str, str], body
             return json_response(200, {"ok": True})
         if path == "/api/throughput":
             return json_response(*throughput.start(data))
+        if path == "/api/suite-results":
+            return json_response(*checks.save_suite(data))
         if path == "/api/reset":
             telemetry.reset()
             return json_response(200, {"ok": True})
