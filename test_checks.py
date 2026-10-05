@@ -239,7 +239,7 @@ def main() -> None:
     assert checks._streamed([0.1, 1.1]) == (False, "2 of 6 chunks arrived")
     streamed, buffered = [0.1, 1.1, 2.1, 3.1, 4.1, 5.1], [5.1] * 6
     with patch.dict(os.environ, LARAVEL_CLOUD="1"):
-        for plain, opted, expected in ((streamed, streamed, "pass"), (buffered, streamed, "warn"), (buffered, buffered, "fail")):
+        for plain, opted, expected in ((streamed, streamed, "pass"), (buffered, streamed, "pass"), (buffered, buffered, "fail")):
             with patch.object(checks, "_arrivals", lambda host, path: opted if "accel=no" in path else plain):
                 assert checks.web_streaming({"host": "app.example"})[0] == expected
     with patch("time.sleep"):  # the WSGI generator: one chunk per send, no Content-Length
@@ -282,10 +282,14 @@ def main() -> None:
     import io
     import sys as _sys
     running = f"{_sys.version_info.major}.{_sys.version_info.minor}"
-    for latest, eol, expected in ((f"{running}.{_sys.version_info.micro}", "2999-01-01", "pass"),
-                                  (f"{running}.{_sys.version_info.micro + 2}", "2999-01-01", "warn"),
-                                  (f"{running}.{_sys.version_info.micro}", "2000-01-01", "warn")):
-        cycle = json.dumps(dict(latest=latest, latestReleaseDate="2026-09-30", eol=eol)).encode()
+    # Patch lag only warns past PATCH_LAG_DAYS; end of life always warns.
+    from datetime import date, timedelta
+    recent, stale = (str(date.today() - timedelta(days=d)) for d in (5, checks.PATCH_LAG_DAYS + 1))
+    for latest, released, eol, expected in ((f"{running}.{_sys.version_info.micro}", recent, "2999-01-01", "pass"),
+                                            (f"{running}.{_sys.version_info.micro + 1}", recent, "2999-01-01", "pass"),
+                                            (f"{running}.{_sys.version_info.micro + 2}", stale, "2999-01-01", "warn"),
+                                            (f"{running}.{_sys.version_info.micro}", recent, "2000-01-01", "warn")):
+        cycle = json.dumps(dict(latest=latest, latestReleaseDate=released, eol=eol)).encode()
         with patch("urllib.request.urlopen", return_value=io.BytesIO(cycle)), patch.object(checks.Path, "read_text", return_value=running):
             status, detail, _ = checks.python_version({})
         assert status == expected, detail
