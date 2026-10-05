@@ -10,7 +10,7 @@ It checks the things a real Python app depends on:
 | Group | What it checks |
 |---|---|
 | Web | server and process count vs `WEB_CONCURRENCY`, `PORT`, the proxy headers (`X-Forwarded-Proto`, `X-Forwarded-For`, `Cloud-Request-ID`), the async event loop isn't blocked, a WebSocket upgrade through Cloud's proxy (ASGI servers only), and that the pod's nginx reaches the app over IPv6 |
-| Logging | [laravel-cloud-logging](https://pypi.org/project/laravel-cloud-logging/) is installed and Cloud's log socket is reachable |
+| Logging | [laravel-cloud-logging](https://pypi.org/project/laravel-cloud-logging/) is installed, Cloud's log socket is reachable, and (from `cloud_suite.py --tier full`) logs render correctly in Cloud's log viewer |
 | Runtime | Python version vs `.python-version`, outbound HTTPS, `/tmp`, CPU and memory limits, subprocesses, threads |
 | Services | Valkey/Redis `PING`, database `SELECT 1` (MySQL or Postgres, from `DATABASE_URL`), DNS for both |
 | Queue | seven jobs through [laravel-cloud-queues](https://pypi.org/project/laravel-cloud-queues/): plain, async, delayed, retried, failing, timed out and a burst of 20 |
@@ -35,16 +35,17 @@ reads to pick the web server). `main` is Python 3.14 on uvicorn.
 These are the servers Cloud's [Python deploy guide](https://cloud.laravel.com/docs/deploy-guides/python#run-a-production-server)
 supports. To test a server on another Python, change `.python-version` on its branch and push.
 
-Pushing a branch deploys its environment. To ship a change to every branch:
+Pushing a branch deploys its environment. To ship `main` to every environment (or the ones named):
 
 ```sh
-for b in python-3.10 python-3.11 python-3.12 python-3.13 python-3.14 \
-         server-gunicorn server-uwsgi server-waitress server-granian-wsgi server-granian-asgi \
-         server-hypercorn-wsgi server-hypercorn-asgi server-daphne; do
-  git switch $b && git merge --no-edit main && git push
-done
-git switch main
+uv run python scripts/ship.py [env ...]
 ```
+
+It merges `origin/main` into each branch in a scratch worktree and pushes. On a conflict `main` wins
+except for the branch's own `.python-version` or `.web-server`; anything it can't resolve stops the run.
+Then it waits until every environment's latest deployment is at its branch head and finished, and exits
+non-zero if any deploy failed or is still running after 30 minutes. You need the
+[Cloud CLI](https://cloud.laravel.com/docs/cli) (`cpx laravel/cloud-cli`), logged in.
 
 Every environment uses the same settings, so results compare across versions:
 
@@ -101,6 +102,28 @@ It keeps the command's exit code and forwards `SIGTERM`, so supervisors still se
 Locally nothing restarts a worker that exits, so the queue's timeout case only passes with a
 restart loop: `while true; do uv run --env-file .env laravel-cloud-queues work app:registry; done`.
 
+## Regression suite
+
+After shipping, run every check on every environment, save the results and compare them with the last run (#19):
+
+```sh
+uv run python cloud_suite.py --tier quick [env ...]   # every row of GET /api/checks, all environments in parallel
+uv run python cloud_suite.py --tier full [env ...]    # also the full-tier jobs (Cloud CLI): logs in Cloud's viewer
+```
+
+Each run writes `results/<UTC time>.json` (one row per environment and check: pass, warn, fail or skip,
+with the detail) and diffs it against the previous file of the same tier. A regression is a check that
+went from pass to fail, or a count that got worse (e.g. plain-text log lines). It prints one table with
+regressions marked `!` and exits non-zero on any regression or failure. The three proxy rows that fail
+everywhere until base-images ships its nginx fixes (#15) are shown as `known, #15` and don't fail the run.
+
+`checks.CHECKS` is the one registry. Each entry has `applies(server, python)` (where it doesn't apply,
+the row is a skip with the reason) and a tier: `quick` runs in the app on every **Run all checks**;
+`full` needs the Cloud CLI, so its job lives in `cloud_suite.JOBS` and the suite posts its result back to
+the row (`POST /api/suite-results`). Until then the row says to run `cloud_suite.py --tier full`. The
+app never calls the Cloud API itself. `test_checks.py` fails if an entry is missing either field, or a
+full-tier entry and its job don't match.
+
 ## HTTP load
 
 Throughput through the queue is on the page. For requests per second through Cloud's ingress,
@@ -121,6 +144,7 @@ uv run --env-file .env python test_checks.py   # check contract
 uv run --env-file .env python test_throughput.py
 uv run python test_servers.py [server ...]     # boots every server in serve.py the way Cloud does
 uv run python logs_check.py [env ...]          # on Cloud: levels, exceptions, request IDs, plain lines (#17)
+uv run python cloud_suite.py --tier full       # on Cloud: everything above, diffed against the last run
 ```
 
 ## Files
@@ -128,7 +152,8 @@ uv run python logs_check.py [env ...]          # on Cloud: levels, exceptions, r
 - `app.py`: queue jobs, the queue check and the `handle()` router both servers share.
 - `serve.py`, `.web-server`: the start command; picks the server.
 - `asgi.py`, `wsgi.py`, `gunicorn.conf.py`: the ASGI and WSGI entrypoints (and gunicorn's settings).
-- `checks.py`: the Web, Logging, Runtime and Services checks behind `GET /api/checks`.
+- `checks.py`: the check registry and the Web, Logging, Runtime and Services checks behind `GET /api/checks`.
+- `cloud_suite.py`: the regression suite; `logs_check.py`: its Cloud log viewer job. `scripts/ship.py`: ship `main` everywhere.
 - `throughput.py`: the throughput test behind `/api/throughput`.
 - `telemetry.py`: job telemetry and the queue check verdicts.
 - `logs.py`: logging setup through laravel-cloud-logging.
