@@ -17,10 +17,9 @@ import tempfile
 import time
 from pathlib import Path
 
-from serve import COMMANDS, SINGLE_PROCESS
+from serve import ASGI, COMMANDS, SINGLE_PROCESS
 
 ROOT = Path(__file__).resolve().parent
-ASGI = {name for name, command in COMMANDS.items() if "asgi:app" in command}
 # uWSGI prints its own boot and shutdown lines from C, outside Python logging: always plain text
 # (laravel-cloud-logging README "Limits"). Every other server must write JSON only.
 JSON_LOGS = set(COMMANDS) - {"uwsgi"}
