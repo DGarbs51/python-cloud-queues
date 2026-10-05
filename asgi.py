@@ -25,6 +25,9 @@ async def app(scope: dict, receive, send) -> None:
         return
     if scope["type"] != "http":
         return
+    if scope["method"] == "GET" and scope["path"] == "/api/stream":
+        await _stream(scope, send)
+        return
     # The address nginx connected from: ::1 when it reaches the app over IPv6, 127.0.0.1 over IPv4.
     checks.PEER.set((scope.get("client") or ("",))[0])
     body, too_large = b"", False
@@ -51,6 +54,18 @@ async def app(scope: dict, receive, send) -> None:
     await send({"type": "http.response.start", "status": status,
                 "headers": [(k.lower().encode("latin-1"), v.encode("latin-1")) for k, v in headers]})
     await send({"type": "http.response.body", "body": payload})
+
+
+async def _stream(scope: dict, send) -> None:
+    """GET /api/stream: one chunk a second, each its own http.response.body. Used by the streaming check."""
+    headers = app_module.stream_headers(scope.get("query_string", b"").decode("latin-1"))
+    await send({"type": "http.response.start", "status": 200,
+                "headers": [(k.lower().encode("latin-1"), v.encode("latin-1")) for k, v in headers]})
+    for i in range(app_module.STREAM_CHUNKS):
+        if i:
+            await asyncio.sleep(1)
+        await send({"type": "http.response.body", "body": app_module.stream_chunk(i), "more_body": True})
+    await send({"type": "http.response.body", "body": b""})
 
 
 async def _websocket(scope: dict, receive, send) -> None:
