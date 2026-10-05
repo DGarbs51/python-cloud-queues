@@ -470,8 +470,10 @@ def tmp_writable(headers) -> Result:
 
 STDLIB = ["sqlite3", "_sqlite3", "ssl", "_ssl", "hashlib", "_hashlib", "lzma", "_lzma", "bz2", "_bz2", "zlib",
           "ctypes", "_ctypes", "zoneinfo", "decimal", "_decimal", "uuid", "_uuid"]
-STDLIB_OPTIONAL = ["readline", "curses", "_curses", "dbm", "_dbm", "tkinter", "_tkinter"]  # not needed on a server
-# Run in a child so imports with side effects (readline, tkinter) never touch the web process.
+# Not needed on a server, so missing ones only warn. tkinter isn't checked: a GUI toolkit is never usable on Cloud
+# (no display), and the slim image leaves it out.
+STDLIB_OPTIONAL = ["readline", "curses", "_curses", "dbm", "_dbm"]
+# Run in a child so imports with side effects (readline) never touch the web process.
 STDLIB_PROBE = """
 import importlib, json, locale, sys
 missing = {}
