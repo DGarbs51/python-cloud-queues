@@ -289,13 +289,18 @@ def main() -> None:
     assert checks.packages_match({})[0] == "pass"
     real = checks.inventory()
     site = next(iter(real["packages"]))
-    bumped = dict(real, packages={site: dict(real["packages"][site], redis="0.0.1")})
-    with patch.object(checks, "inventory", return_value=bumped):
-        status, detail, _ = checks.packages_match({})
-    assert status == "fail" and "redis 0.0.1" in detail, detail
-    shadow = dict(real, packages={**real["packages"], "/usr/local/lib/site-packages": {"certifi": "1999.1.1"}})
-    with patch.object(checks, "inventory", return_value=shadow):
-        assert checks.packages_match({})[0] == "warn"
+    image = checks.sysconfig.get_paths(vars={"base": sys.base_prefix, "platbase": sys.base_prefix})["purelib"]
+    cases = (({site: dict(real["packages"][site], redis="0.0.1")}, "fail"),
+             # Two locked versions (one per Python range) are both fine.
+             ({site: dict(real["packages"][site], websockets="16.1.1")}, "pass"),
+             # The image's setuptools only matters when it would import ahead of the app's copy.
+             ({**real["packages"], image: {"setuptools": "79.0.1", "pip": "24.0"}}, "pass"),
+             ({image: {"setuptools": "79.0.1"}, **real["packages"]}, "pass"),  # 3.11: the app needs no setuptools
+             ({image: {"certifi": "1999.1.1"}, **real["packages"]}, "warn"))
+    for packages, expected in cases:
+        with patch.object(checks, "inventory", return_value=dict(real, packages=packages)):
+            status, detail, _ = checks.packages_match({})
+        assert status == expected, (expected, detail)
     status, _, body = app.handle("GET", "/api/packages", {}, b"")
     assert status == 200 and set(json.loads(body)) == {"python", "native", "packages"}
 

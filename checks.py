@@ -522,27 +522,36 @@ def inventory() -> dict:
 
 def packages_match(headers) -> Result:
     lock = Path(__file__).with_name("uv.lock").read_text()
-    locked = dict(re.findall(r'\[\[package\]\]\nname = "([^"]+)"\nversion = "([^"]+)"', lock))
+    # uv.lock can pin one package at several versions, one per range of Python versions.
+    locked: dict[str, set[str]] = {}
+    for name, version in re.findall(r'\[\[package\]\]\nname = "([^"]+)"\nversion = "([^"]+)"', lock):
+        locked.setdefault(name, set()).add(version)
     block = re.search(r"^dependencies = \[(.*?)^\]", Path(__file__).with_name("pyproject.toml").read_text(), re.S | re.M)
     direct = [_canonical(name) for name in re.findall(r'^\s*"([A-Za-z0-9_.-]+)', block.group(1), re.M)]
-    # sys.path order: the first copy of a package is the one imported. A second copy elsewhere is shadowed.
-    found: dict[str, list[tuple[str, str]]] = {}
+    # The image's own packages (pip, setuptools, ...) live in the interpreter's site-packages; the app's anywhere else.
+    image_dir = sysconfig.get_paths(vars={"base": sys.base_prefix, "platbase": sys.base_prefix})["purelib"]
+    app_copies: dict[str, str] = {}
+    image_copies: dict[str, str] = {}
+    imported: dict[str, str] = {}  # sys.path order: the first copy is the one imported
     for location, names in inventory()["packages"].items():
+        image = os.path.realpath(location) == os.path.realpath(image_dir)
         for name, version in names.items():
-            found.setdefault(name, []).append((version, location))
-    missing = [name for name in direct if name not in found]
-    wrong = [f"{name} {copies[0][0]} (locked {locked[name]})" for name, copies in found.items()
-             if name in locked and copies[0][0] != locked[name]]
-    extra = sorted(f"{name} {copies[0][0]}" for name, copies in found.items() if name not in locked)
-    shadowed = sorted(name for name, copies in found.items() if len({v for v, _ in copies}) > 1)
-    detail = f"{sum(name in locked for name in found)} installed packages match uv.lock" + (
-        f"; not in uv.lock: {', '.join(extra)}" if extra else "")
+            (image_copies if image else app_copies).setdefault(name, version)
+            imported.setdefault(name, "image" if image else "app")
+    # The app installed its own copy, but the image's comes first on sys.path.
+    shadowed = [f"{name} {image_copies[name]}" for name in app_copies if name in image_copies and imported[name] == "image"]
+    missing = [name for name in direct if name not in app_copies and name not in image_copies]
+    wrong = [f"{name} {version} (locked {', '.join(sorted(locked[name]))})" for name, version in app_copies.items()
+             if name in locked and version not in locked[name]]
+    extra = sorted(f"{name} {version}" for name, version in app_copies.items() if name not in locked)
+    detail = f"{len(app_copies) - len(extra)} app packages match uv.lock" + (f"; not in uv.lock: {', '.join(extra)}" if extra else "") + (
+        f"; image preinstalls {', '.join(f'{n} {v}' for n, v in sorted(image_copies.items()))}" if image_copies else "")
     if missing or wrong:
         return "fail", "; ".join(filter(None, [missing and f"missing: {', '.join(missing)}", wrong and f"wrong version: {', '.join(wrong)}"])), (
             "The installed packages don't match uv.lock, so the build didn't install what the lock file pins.")
     if shadowed:
-        return "warn", f"{detail}; installed twice with different versions: {', '.join(shadowed)}", (
-            "A package the image preinstalls shadows (or is shadowed by) the app's copy. Which one imports depends on sys.path.")
+        return "warn", f"{detail}; the image's copy is imported instead of the app's: {', '.join(shadowed)}", (
+            "A package the image preinstalls comes first on sys.path, so the app imports it instead of the version uv.lock pins.")
     return "pass", detail, ""
 
 
