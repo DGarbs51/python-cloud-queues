@@ -14,6 +14,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -41,6 +42,9 @@ def request(port, method, path, body=b"", headers=None, host="::1"):
     finally:
         conn.close()
 
+# Servers that finish a request in flight when SIGTERM arrives (#7).
+DRAINS = {"uvicorn", "gunicorn", "granian-wsgi", "granian-asgi"}
+
 
 def check(server: str) -> None:
     port = free_port()
@@ -61,7 +65,8 @@ def check(server: str) -> None:
                 assert time.monotonic() < deadline, f"{server} not ready on [::]:{port}"
                 time.sleep(0.1)
             status, headers, body = request(port, "GET", "/api/ping", headers={"Cloud-Request-ID": "cr-test"})
-            assert (status, json.loads(body)) == (200, {"ok": True}) and headers.get("x-request-id")
+            pong = json.loads(body)
+            assert status == 200 and pong["ok"] and pong["pid"] and headers.get("x-request-id"), (status, pong)
             assert request(port, "GET", "/")[0] == 200
             # Cloud's nginx connects to 127.0.0.1, so [::] must not be IPv6-only.
             assert request(port, "GET", "/api/ping", host="127.0.0.1")[0] == 200, f"{server} unreachable over IPv4"
@@ -97,8 +102,24 @@ def check(server: str) -> None:
             assert request(port, "GET", "/api/boom-thread?marker=t-thread")[0] == 200
             big = b"x" * (64 * 1024 + 1)
             assert request(port, "POST", "/api/check", big, {"Content-Type": "application/json"})[0] == 400
+            # SIGTERM with a slow request in flight: a draining server finishes it before exiting (#7).
+            slow: list = []
+
+            def call_slow() -> None:
+                try:
+                    slow.append(request(port, "GET", "/api/slow?seconds=2")[0])
+                except OSError as exc:  # http.client.RemoteDisconnected is a ConnectionResetError
+                    slow.append(type(exc).__name__)
+
+            caller = threading.Thread(target=call_slow)
+            caller.start()
+            time.sleep(0.5)
             os.killpg(proc.pid, signal.SIGTERM)
-            # waitress has no SIGTERM handler: it dies mid-request instead of draining.
+            caller.join(timeout=30)
+            # Locally, with their serve.py flags, only these finish the in-flight request. The others drop it:
+            # waitress has no SIGTERM handler, and uWSGI, hypercorn and daphne exit without waiting for it.
+            drained = server in DRAINS
+            assert (slow == [200]) == drained, f"{server} slow request during SIGTERM: {slow}"
             clean = -signal.SIGTERM if server == "waitress" else 0
             assert proc.wait(timeout=40) == clean, f"{server} exit code {proc.returncode}"
         finally:
