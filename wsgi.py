@@ -26,7 +26,10 @@ def app(environ: dict, start_response):
     except ValueError:
         length = -1
     chunked = "chunked" in environ.get("HTTP_TRANSFER_ENCODING", "").lower()
-    if not environ.get("CONTENT_LENGTH") and (environ.get("wsgi.input_terminated") or chunked):
+    uploaded = None
+    if environ.get("REQUEST_METHOD") == "POST" and environ.get("PATH_INFO") == "/api/upload":
+        uploaded, length, body = _count_upload(environ, length, chunked), 0, b""
+    elif not environ.get("CONTENT_LENGTH") and (environ.get("wsgi.input_terminated") or chunked):
         # Chunked body: no length up front, so read one byte past the cap to detect oversize.
         # gunicorn sets wsgi.input_terminated; hypercorn buffers the body without saying so.
         body = environ["wsgi.input"].read(app_module.MAX_BODY + 1)
@@ -47,9 +50,24 @@ def app(environ: dict, start_response):
             body = environ["wsgi.input"].read(length) if length else b""
         # The address nginx connected from: ::1 over IPv6, 127.0.0.1 over IPv4.
         checks.PEER.set(environ.get("REMOTE_ADDR", ""))
-        status, headers, body = app_module.handle(environ.get("REQUEST_METHOD", "GET"), path, headers, body)
+        status, headers, body = app_module.handle(environ.get("REQUEST_METHOD", "GET"), path, headers, body, uploaded)
     start_response(f"{status} {http.client.responses.get(status, 'Error')}", headers)
     return [body]
+
+
+def _count_upload(environ: dict, length: int, chunked: bool) -> int:
+    """POST /api/upload: read the body in chunks and count it without keeping it (#10). Stops past UPLOAD_MAX."""
+    if length < 0 or length > app_module.UPLOAD_MAX:
+        return length  # rejected by handle() without reading
+    sized = bool(environ.get("CONTENT_LENGTH"))  # else chunked: read until the server signals the end
+    count = 0
+    while count <= app_module.UPLOAD_MAX and (not sized or count < length):
+        chunk = environ["wsgi.input"].read(min(app_module.UPLOAD_CHUNK, length - count) if sized else app_module.UPLOAD_CHUNK)
+        if not chunk:
+            break
+        count += len(chunk)
+    # uWSGI can't de-chunk into wsgi.input and reads b"": reject rather than report a truncated body.
+    return -1 if chunked and not sized and not count else count
 
 
 def _stream():
