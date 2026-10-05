@@ -100,6 +100,17 @@ def check(server: str) -> None:
                 boom = None
             assert boom == (None if server == "uwsgi" else 500), f"{server} /api/boom: {boom}"
             assert request(port, "GET", "/api/boom-thread?marker=t-thread")[0] == 200
+            # /api/upload counts bodies far past the 64 KiB cap, sized or chunked, without truncating them (#10).
+            # uWSGI can't read chunked bodies, so it rejects them (Cloud's nginx always sends a Content-Length):
+            # send it a tiny one, since it answers before reading and a big one would end in a broken pipe.
+            size = 3 * 1024 * 1024 + 7
+            chunks = [b"u" * 65536] * (size // 65536) + [b"u" * (size % 65536)]
+            upload = {"Content-Type": "application/octet-stream"}
+            assert json.loads(request(port, "POST", "/api/upload", b"".join(chunks), upload)[2]) == {"bytes": size}
+            chunked = {**upload, "Transfer-Encoding": "chunked"}
+            status, _, body = request(port, "POST", "/api/upload", [b"u"] if server == "uwsgi" else chunks, chunked)
+            expected = (400, {"error": "invalid Content-Length"}) if server == "uwsgi" else (200, {"bytes": size})
+            assert (status, json.loads(body)) == expected, f"{server} chunked upload: {status} {body}"
             big = b"x" * (64 * 1024 + 1)
             assert request(port, "POST", "/api/check", big, {"Content-Type": "application/json"})[0] == 400
             # SIGTERM with a slow request in flight: a draining server finishes it before exiting (#7).
