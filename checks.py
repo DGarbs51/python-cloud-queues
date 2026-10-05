@@ -743,6 +743,11 @@ def asgi_only(server: str, python: str) -> bool:
     return server in serve.ASGI
 
 
+def upload_pair(server: str, python: str) -> bool:
+    """The body limit is a proxy setting, so the suite uploads its 1.4 GB ladder on one ASGI and one WSGI environment: uvicorn on Python 3.14 and gunicorn."""
+    return server == "gunicorn" or (server == "uvicorn" and python == "3.14")
+
+
 FAIL_HELP = "The check could not complete. See the detail for the error, then check the network and service settings of this environment."
 
 CHECKS = [  # (group, id, title, fn, applies, tier); full-tier rows have no fn here: their job is in cloud_suite.JOBS
@@ -757,6 +762,7 @@ CHECKS = [  # (group, id, title, fn, applies, tier); full-tier rows have no fn h
     ("Web", "web.upstream_ipv6", "nginx reaches the app over IPv6", web_upstream_ipv6, everywhere, "quick"),
     ("Web", "web.streaming", "Streamed responses arrive as sent", web_streaming, everywhere, "quick"),
     ("Web", "web.static", "Static files served by nginx", web_static, everywhere, "quick"),
+    ("Web", "web.upload_limit", "Largest upload through Cloud's proxy", None, upload_pair, "full"),
     ("Logging", "logging.handler", "Cloud logging handler installed", log_handler, everywhere, "quick"),
     ("Logging", "logging.socket", "Cloud log socket reachable", log_socket, everywhere, "quick"),
     ("Logging", "logging.cloud_viewer", "Logs render in Cloud's log viewer", None, everywhere, "full"),

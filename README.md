@@ -9,7 +9,7 @@ It checks the things a real Python app depends on:
 
 | Group | What it checks |
 |---|---|
-| Web | server and process count vs `WEB_CONCURRENCY`, `WEB_CONCURRENCY` vs Cloud's sizing formula, `PORT`, the proxy headers (`X-Forwarded-Proto`, `X-Forwarded-For`, `Cloud-Request-ID`), the async event loop isn't blocked, a WebSocket upgrade through Cloud's proxy (ASGI servers only), that the pod's nginx reaches the app over IPv6, that streamed responses (`/api/stream`, server-sent events) arrive as sent with and without `X-Accel-Buffering: no`, and that nginx serves `public/` itself with Cloud's cache headers while refusing dotfiles, logs and SQL dumps |
+| Web | server and process count vs `WEB_CONCURRENCY`, `WEB_CONCURRENCY` vs Cloud's sizing formula, `PORT`, the proxy headers (`X-Forwarded-Proto`, `X-Forwarded-For`, `Cloud-Request-ID`), the async event loop isn't blocked, a WebSocket upgrade through Cloud's proxy (ASGI servers only), that the pod's nginx reaches the app over IPv6, that streamed responses (`/api/stream`, server-sent events) arrive as sent with and without `X-Accel-Buffering: no`, that nginx serves `public/` itself with Cloud's cache headers while refusing dotfiles, logs and SQL dumps, and (from `cloud_suite.py --tier full`) the largest upload that gets through |
 | Logging | [laravel-cloud-logging](https://pypi.org/project/laravel-cloud-logging/) is installed, Cloud's log socket is reachable, and (from `cloud_suite.py --tier full`) logs render correctly in Cloud's log viewer |
 | Runtime | Python version vs `.python-version`, the newest patch release and end of life ([endoflife.date](https://endoflife.date/python)), the standard library's C extensions, time-zone data and UTF-8, installed packages vs `uv.lock`, outbound HTTPS, `/tmp`, CPU and memory limits, subprocesses, threads |
 | Services | Valkey/Redis `PING`, database `SELECT 1` (MySQL or Postgres, from `DATABASE_URL`), DNS for both |
@@ -125,6 +125,24 @@ the row (`POST /api/suite-results`). Until then the row says to run `cloud_suite
 app never calls the Cloud API itself. `test_checks.py` fails if an entry is missing either field, or a
 full-tier entry and its job don't match.
 
+## Upload limit
+
+**The largest request body Cloud accepts is 500 MiB (524,288,000 bytes).** Cloudflare's edge sets it,
+in front of everything in the environment, so no environment setting raises it. One byte more gets
+Cloudflare's own `413 Payload Too Large` page, straight away, from the `Content-Length`. Without a
+`Content-Length` (a chunked or streamed upload), Cloudflare counts the bytes and returns the same `413`
+once the body passes the limit. The pod's nginx allows 2048M, so it's never the one that refuses.
+
+An upload under the limit can still fail on the environment's HTTP timeout (5–60 s) on a slow link.
+For bigger files, or slow uploaders, upload straight to object storage with a presigned URL.
+
+`POST /api/upload` counts the body in 1 MiB chunks without keeping it and returns `{"bytes": n}` (its
+own cap is 512 MiB). To measure it on every environment:
+
+```sh
+uv run python upload_check.py [env ...]   # 1 MB to 500 MiB + 1 byte, then 501 MiB with no Content-Length
+```
+
 ## HTTP load
 
 Throughput through the queue is on the page. For requests per second through Cloud's ingress,
@@ -145,6 +163,7 @@ uv run --env-file .env python test_checks.py   # check contract
 uv run --env-file .env python test_throughput.py
 uv run python test_servers.py [server ...]     # boots every server in serve.py the way Cloud does
 uv run python logs_check.py [env ...]          # on Cloud: levels, exceptions, request IDs, plain lines (#17)
+uv run python upload_check.py [env ...]        # on Cloud: the largest upload through Cloud's proxy (#10)
 uv run python cloud_suite.py --tier full       # on Cloud: everything above, diffed against the last run
 ```
 
@@ -154,7 +173,7 @@ uv run python cloud_suite.py --tier full       # on Cloud: everything above, dif
 - `serve.py`, `.web-server`: the start command; picks the server.
 - `asgi.py`, `wsgi.py`, `gunicorn.conf.py`: the ASGI and WSGI entrypoints (and gunicorn's settings).
 - `checks.py`: the check registry and the Web, Logging, Runtime and Services checks behind `GET /api/checks`.
-- `cloud_suite.py`: the regression suite; `logs_check.py`: its Cloud log viewer job. `scripts/ship.py`: ship `main` everywhere.
+- `cloud_suite.py`: the regression suite; `logs_check.py`: its Cloud log viewer job; `upload_check.py`: its upload limit job. `scripts/ship.py`: ship `main` everywhere.
 - `throughput.py`: the throughput test behind `/api/throughput`.
 - `telemetry.py`: job telemetry and the queue check verdicts.
 - `logs.py`: logging setup through laravel-cloud-logging.
