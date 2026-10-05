@@ -15,6 +15,7 @@ import logging
 import os
 import random
 import re
+import socket
 import sys
 import threading
 import time
@@ -48,6 +49,7 @@ LOG_TEST_LEVELS = {"debug": logging.DEBUG, "info": logging.INFO, "notice": NOTIC
                    "error": logging.ERROR, "critical": logging.CRITICAL, "alert": ALERT, "emergency": EMERGENCY}
 LOG_TEST_UNICODE = "日本語 · émoji 🚀"
 STREAM_CHUNKS = 6  # /api/stream sends one a second; web.streaming times when each arrives (#8)
+SLOW_MAX = 300  # /api/slow cap in seconds: above Cloud's 60 s HTTP timeout, so the timeout test (#9) can cross it
 
 
 class Boom(Exception):
@@ -188,7 +190,14 @@ def _handle(method: str, path: str, query: str, headers: Mapping[str, str], body
             content = INDEX.read_bytes()
             return 200, [("Content-Type", "text/html; charset=utf-8"), ("Content-Length", str(len(content)))], content
         if path == "/api/ping":
-            return json_response(200, {"ok": True})
+            return json_response(200, {"ok": True, **instance()})
+        if path == "/api/slow":
+            # Blocks this worker (WSGI) or a thread off the event loop (ASGI), like a real slow request (#7, #9).
+            seconds = next((v for k, v in parse_qsl(query) if k == "seconds"), "")
+            if not seconds.isdigit() or not 1 <= int(seconds) <= SLOW_MAX:
+                return json_response(400, {"error": f"seconds must be 1-{SLOW_MAX}"})
+            time.sleep(int(seconds))
+            return json_response(200, {"ok": True, "slept": int(seconds), **instance()})
         if path == "/api/stats":
             return json_response(200, {**telemetry.snapshot(), "server": SERVER})
         if path == "/api/checks":
@@ -223,6 +232,11 @@ def _handle(method: str, path: str, query: str, headers: Mapping[str, str], body
             telemetry.reset()
             return json_response(200, {"ok": True})
     return json_response(404, {"error": "not found"})
+
+
+def instance() -> dict:
+    """Which deployment, instance and worker answered: DEPLOY_MARKER is set before each test deploy (#7)."""
+    return {"deploy": os.environ.get("DEPLOY_MARKER", ""), "pod": socket.gethostname(), "pid": os.getpid()}
 
 
 def stream_headers(query: str) -> list[tuple[str, str]]:
@@ -269,8 +283,16 @@ def self_check() -> None:
     """Router contract without Redis: run with `python app.py --self-check`."""
     from unittest.mock import patch
 
-    assert handle("GET", "/api/ping?x=1", {"X-Request-ID": "abc"}, b"") == (
-        200, [("Content-Type", "application/json"), ("Content-Length", "12"), ("X-Request-ID", "abc")], b'{"ok": true}')
+    with patch.dict(os.environ, DEPLOY_MARKER="m-1"):
+        status, headers, payload = handle("GET", "/api/ping?x=1", {"X-Request-ID": "abc"}, b"")
+    assert status == 200 and ("X-Request-ID", "abc") in headers, headers
+    assert json.loads(payload) == {"ok": True, "deploy": "m-1", "pod": socket.gethostname(), "pid": os.getpid()}
+    with patch("time.sleep") as sleep:
+        status, _, payload = handle("GET", "/api/slow?seconds=2", {}, b"")
+        assert status == 200 and json.loads(payload)["slept"] == 2 and sleep.call_args.args == (2,)
+        for bad in ("0", "301", "-1", "1.5", "x", ""):
+            assert handle("GET", f"/api/slow?seconds={bad}", {}, b"")[0] == 400, bad
+        assert sleep.call_count == 1
     assert handle("GET", "/", {}, b"")[0] == 200
     assert handle("GET", "/nope", {}, b"")[0] == 404
     assert handle("POST", "/api/check", {"Content-Type": "text/plain"}, b"{}")[0] == 415
