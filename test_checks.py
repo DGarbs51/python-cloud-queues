@@ -211,6 +211,94 @@ def main() -> None:
         checks.PEER.set("")
     assert checks.web_upstream_ipv6({})[0] == "skip"
 
+    # WEB_CONCURRENCY vs Cloud's generic-Python formula max(1, min(2c + 1, MiB // 150)) (#13).
+    assert checks.web_concurrency({})[0] == "skip"  # off Cloud
+    mib = 2**20 // 4096  # pages per MiB at a 4096-byte page
+    for cores, memory, value, status, limited in ((2, 4096, "5", "pass", "cpu"), (2, 512, "3", "pass", "memory"),
+                                                  (1, 256, "1", "pass", "memory"), (2, 4096, "3", "warn", "cpu"),
+                                                  (2, 4096, "", "warn", "")):
+        with patch.dict(os.environ, LARAVEL_CLOUD="1", WEB_CONCURRENCY=value), \
+                patch.object(checks, "_cgroup", {"cpu.max": f"{cores}00000 100000"}.get), \
+                patch("os.cpu_count", return_value=cores), patch("os.sysconf", lambda name: 4096 if name == "SC_PAGE_SIZE" else memory * mib):
+            got, detail, _ = checks.web_concurrency({})
+            assert got == status and f"{limited}-limited" in detail, (cores, memory, value, detail)
+    with patch.dict(os.environ, LARAVEL_CLOUD="1", WEB_CONCURRENCY="5"), patch.object(checks, "_cgroup", {"cpu.max": "200000 100000"}.get), \
+            patch("os.cpu_count", return_value=16):
+        assert "above the cgroup CPU limit" in checks.web_concurrency({})[1]  # the bootstrap didn't run
+
+    # Streaming (#8): six chunks a second apart; scored on when they arrive.
+    assert checks._streamed([0.1, 1.1, 2.1, 3.1, 4.1, 5.1]) == (True, "first chunk at 0.10 s, largest gap 1.00 s (streamed)")
+    assert checks._streamed([5.1, 5.1, 5.1, 5.1, 5.1, 5.1])[1].endswith("(buffered: all at once)")
+    assert checks._streamed([0.1, 0.1, 0.1, 3.1, 3.1, 5.1])[1].endswith("(in bursts)")
+    assert checks._streamed([0.1, 1.1]) == (False, "2 of 6 chunks arrived")
+    streamed, buffered = [0.1, 1.1, 2.1, 3.1, 4.1, 5.1], [5.1] * 6
+    with patch.dict(os.environ, LARAVEL_CLOUD="1"):
+        for plain, opted, expected in ((streamed, streamed, "pass"), (buffered, streamed, "warn"), (buffered, buffered, "fail")):
+            with patch.object(checks, "_arrivals", lambda host, path: opted if "accel=no" in path else plain):
+                assert checks.web_streaming({"host": "app.example"})[0] == expected
+    with patch("time.sleep"):  # the WSGI generator: one chunk per send, no Content-Length
+        import wsgi
+        assert len(list(wsgi._stream())) == app.STREAM_CHUNKS
+    assert app.stream_headers("accel=no") == [("Content-Type", "text/event-stream"), ("X-Accel-Buffering", "no")]
+
+    # Static files (#14): exact bytes from nginx, Cloud's cache headers, blocked files refused, the rest reaching the app.
+    def answers(**override):
+        def get(host, path):
+            name = path.lstrip("/")
+            if name in override:
+                return override[name]
+            if name in checks.STATIC:
+                cache = {"cache-control": checks.STATIC[name]} if checks.STATIC[name] else {}
+                return 200, cache, (checks.PUBLIC / name).read_bytes()
+            if name in checks.STATIC_BLOCKED:
+                return 403, {}, b"<html>403 Forbidden</html>"
+            return 404, {"x-request-id": "r"}, b'{"error": "not found"}'
+        return get
+    with patch.dict(os.environ, LARAVEL_CLOUD="1"):
+        for override, expected in (({}, "pass"), ({"static/cloud-check.css": (200, {}, (checks.PUBLIC / "static/cloud-check.css").read_bytes())}, "warn"),
+                                   ({"cloud-check.sql": (200, {}, (checks.PUBLIC / "cloud-check.sql").read_bytes())}, "fail"),
+                                   ({"robots.txt": (404, {"x-request-id": "r"}, b'{"error": "not found"}')}, "fail"),
+                                   ({"cloud-check-missing.txt": (404, {}, b"<html>nginx 404</html>")}, "fail")):
+            with patch.object(checks, "_get", answers(**override)):
+                status, detail, _ = checks.web_static({"host": "app.example"})
+                assert status == expected, (override, detail)
+                assert expected == "pass" or next(iter(override)) in detail, detail
+
+    # Latest patch and end of life (#12), from endoflife.date.
+    import io
+    import sys as _sys
+    running = f"{_sys.version_info.major}.{_sys.version_info.minor}"
+    for latest, eol, expected in ((f"{running}.{_sys.version_info.micro}", "2999-01-01", "pass"),
+                                  (f"{running}.{_sys.version_info.micro + 2}", "2999-01-01", "warn"),
+                                  (f"{running}.{_sys.version_info.micro}", "2000-01-01", "warn")):
+        cycle = json.dumps(dict(latest=latest, latestReleaseDate="2026-09-30", eol=eol)).encode()
+        with patch("urllib.request.urlopen", return_value=io.BytesIO(cycle)), patch.object(checks.Path, "read_text", return_value=running):
+            status, detail, _ = checks.python_version({})
+        assert status == expected, detail
+    assert "release(s) behind" in detail or "end of life" in detail
+
+    # Standard library (#11): required modules fail the row, optional ones only warn.
+    for missing, expected in (({}, "pass"), ({"_tkinter": "ModuleNotFoundError"}, "warn"), ({"_lzma": "ModuleNotFoundError"}, "fail")):
+        probe = json.dumps(dict(missing=missing, encodings=["utf-8", "UTF-8"]))
+        with patch("subprocess.run", return_value=subprocess.CompletedProcess([], 0, probe, "")):
+            status, detail, _ = checks.stdlib_complete({})
+        assert status == expected and all(name in detail for name in missing), detail
+    assert checks.stdlib_complete({})[0] in ("pass", "warn")  # the real probe
+
+    # Installed packages vs uv.lock: this venv is uv's, so it matches; a changed version fails.
+    assert checks.packages_match({})[0] == "pass"
+    real = checks.inventory()
+    site = next(iter(real["packages"]))
+    bumped = dict(real, packages={site: dict(real["packages"][site], redis="0.0.1")})
+    with patch.object(checks, "inventory", return_value=bumped):
+        status, detail, _ = checks.packages_match({})
+    assert status == "fail" and "redis 0.0.1" in detail, detail
+    shadow = dict(real, packages={**real["packages"], "/usr/local/lib/site-packages": {"certifi": "1999.1.1"}})
+    with patch.object(checks, "inventory", return_value=shadow):
+        assert checks.packages_match({})[0] == "warn"
+    status, _, body = app.handle("GET", "/api/packages", {}, b"")
+    assert status == 200 and set(json.loads(body)) == {"python", "native", "packages"}
+
     # The endpoint finishes fast even with every network check stubbed.
     started = time.monotonic()
     offline_run({})
