@@ -50,6 +50,9 @@ LOG_TEST_LEVELS = {"debug": logging.DEBUG, "info": logging.INFO, "notice": NOTIC
 LOG_TEST_UNICODE = "日本語 · émoji 🚀"
 STREAM_CHUNKS = 6  # /api/stream sends one a second; web.streaming times when each arrives (#8)
 SLOW_MAX = 300  # /api/slow cap in seconds: above Cloud's 60 s HTTP timeout, so the timeout test (#9) can cross it
+# /api/upload's own cap (#10): above Cloudflare's 500 MiB edge limit, so the edge is what an upload test hits first.
+UPLOAD_MAX = 512 * 1024 * 1024
+UPLOAD_CHUNK = 1024 * 1024
 
 
 class Boom(Exception):
@@ -148,15 +151,18 @@ def _reject_constant(value: str):
     raise ValueError(f"invalid JSON constant: {value}")
 
 
-def handle(method: str, path: str, headers: Mapping[str, str], body: bytes) -> Response:
-    """Route one request. Adds X-Request-ID and writes one access log line."""
+def handle(method: str, path: str, headers: Mapping[str, str], body: bytes, uploaded: int | None = None) -> Response:
+    """Route one request. Adds X-Request-ID and writes one access log line.
+
+    uploaded: POST /api/upload's body size, counted by asgi.py / wsgi.py instead of passing the body (#10).
+    """
     started = time.monotonic()
     supplied = next((v for k, v in headers.items() if k.lower() == "x-request-id"), "")
     request_id = supplied if re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", supplied) else uuid.uuid4().hex
     path, query = urlsplit(path).path, urlsplit(path).query
     with logs.context(request_id=request_id):
         try:
-            status, response_headers, payload = _handle(method, path, query, headers, body)
+            status, response_headers, payload = _handle(method, path, query, headers, body, uploaded)
         except Boom:
             raise
         except Exception:
@@ -171,7 +177,14 @@ def handle(method: str, path: str, headers: Mapping[str, str], body: bytes) -> R
     return status, [*response_headers, ("X-Request-ID", request_id)], payload
 
 
-def _handle(method: str, path: str, query: str, headers: Mapping[str, str], body: bytes) -> Response:
+def _handle(method: str, path: str, query: str, headers: Mapping[str, str], body: bytes, uploaded: int | None) -> Response:
+    if method == "POST" and path == "/api/upload" and uploaded is not None:
+        # Side-effect free, so any Content-Type is fine: the upload limit test (#10) posts raw bytes.
+        if uploaded < 0:
+            return json_response(400, {"error": "invalid Content-Length"})
+        if uploaded > UPLOAD_MAX:
+            return json_response(413, {"error": f"body exceeds {UPLOAD_MAX // 2**20} MiB"})
+        return json_response(200, {"bytes": uploaded})
     if len(body) > MAX_BODY:
         return json_response(400, {"error": "body exceeds 64 KiB"})
     if method == "POST":
@@ -293,6 +306,12 @@ def self_check() -> None:
         for bad in ("0", "301", "-1", "1.5", "x", ""):
             assert handle("GET", f"/api/slow?seconds={bad}", {}, b"")[0] == 400, bad
         assert sleep.call_count == 1
+    upload = {"Content-Type": "application/octet-stream"}
+    status, _, payload = handle("POST", "/api/upload", upload, b"", uploaded=5)
+    assert status == 200 and json.loads(payload) == {"bytes": 5}, payload
+    assert handle("POST", "/api/upload", upload, b"", uploaded=UPLOAD_MAX + 1)[0] == 413
+    assert handle("POST", "/api/upload", upload, b"", uploaded=-1)[0] == 400
+    assert handle("POST", "/api/upload", upload, b"x")[0] == 415  # only the entrypoints' count reaches the route
     assert handle("GET", "/", {}, b"")[0] == 200
     assert handle("GET", "/nope", {}, b"")[0] == 404
     assert handle("POST", "/api/check", {"Content-Type": "text/plain"}, b"{}")[0] == 415
