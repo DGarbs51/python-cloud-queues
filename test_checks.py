@@ -292,7 +292,7 @@ def main() -> None:
     assert "release(s) behind" in detail or "end of life" in detail
 
     # Standard library (#11): required modules fail the row, optional ones only warn.
-    for missing, expected in (({}, "pass"), ({"_tkinter": "ModuleNotFoundError"}, "warn"), ({"_lzma": "ModuleNotFoundError"}, "fail")):
+    for missing, expected in (({}, "pass"), ({"_curses": "ModuleNotFoundError"}, "warn"), ({"_lzma": "ModuleNotFoundError"}, "fail")):
         probe = json.dumps(dict(missing=missing, encodings=["utf-8", "UTF-8"]))
         with patch("subprocess.run", return_value=subprocess.CompletedProcess([], 0, probe, "")):
             status, detail, _ = checks.stdlib_complete({})
