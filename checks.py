@@ -303,7 +303,8 @@ def web_streaming(headers) -> Result:
 
 
 PUBLIC = Path(__file__).with_name("public")
-# Fixtures under public/ (#14), with the Cache-Control Cloud's nginx adds by content type (None: no header).
+# Fixtures under public/ (#14), with the Cache-Control Cloud's nginx adds by content type. None: the type has no fixed
+# value, so nginx sends NGINX_CACHE_DEFAULT, which Cloud's operator sets to "no-cache, private" for now (SE-290).
 STATIC = {
     "cloud-check.txt": None,
     "static/cloud-check.css": "public, max-age=31536000, immutable",
@@ -313,6 +314,10 @@ STATIC = {
     ".well-known/cloud-check.txt": None,
 }
 STATIC_BLOCKED = [".cloud-check-secret", "cloud-check.sql", "cloud-check.log"]  # nginx must refuse these
+
+
+def static_cache(path: str) -> str | None:
+    return STATIC[path] or os.environ.get("NGINX_CACHE_DEFAULT") or None
 
 
 def _get(host: str, path: str) -> tuple[int, dict[str, str], bytes]:
@@ -336,8 +341,9 @@ def web_static(headers) -> Result:
         answers = dict(zip(paths, pool.map(lambda path: _get(host, "/" + path), paths)))
     broken, cache = [], []
     # The app has no route for these paths, so the file's exact bytes can only have come from nginx.
-    for path, expected in STATIC.items():
+    for path in STATIC:
         status, got, body = answers[path]
+        expected = static_cache(path)
         if status != 200 or body != (PUBLIC / path).read_bytes():
             broken.append(f"{path}: {status}, {'wrong content' if status == 200 else 'not served'}")
         elif got.get("cache-control") != expected:
