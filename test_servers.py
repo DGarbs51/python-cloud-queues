@@ -111,6 +111,8 @@ def check(server: str) -> None:
         assert "exception" in errors[0]["context"], f"{server}: {marker} record: {errors[0]}"
     # The middleware logs a request's uncaught exception while its ID is set, so it can be traced to the request.
     boom = next(r for r in records if "uncaught boom t-boom" in json.dumps(r))
+    assert (boom["extra"].get("logger"), boom["message"], boom["level_name"]) == (
+        "uncaught", "Uncaught exception in GET /api/boom", "ERROR"), f"{server}: {boom}"
     assert boom["context"].get("cloud_request_id") == "cr-boom", f"{server}: no request ID on {boom}"
     startups = {r["context"].get("pid") for r in records if r["message"] == "startup"}
     expected = 1 if server in SINGLE_PROCESS else 2
