@@ -133,6 +133,10 @@ Cloudflare's own `413 Payload Too Large` page, straight away, from the `Content-
 `Content-Length` (a chunked or streamed upload), Cloudflare counts the bytes and returns the same `413`
 once the body passes the limit. The pod's nginx allows 2048M, so it's never the one that refuses.
 
+Your web server can set a lower limit. hypercorn's WSGI mode (`hypercorn wsgi:app`) holds the whole body
+in memory and answers an empty `400` above **16 MiB**; raise `wsgi_max_body_size` in a `-c` config file
+(there's no CLI flag). hypercorn's ASGI mode and the other servers here don't cap it below Cloudflare's 500 MiB.
+
 An upload under the limit can still fail on the environment's HTTP timeout (5–60 s) on a slow link.
 For bigger files, or slow uploaders, upload straight to object storage with a presigned URL.
 
