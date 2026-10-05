@@ -22,7 +22,7 @@ import logs_check
 
 RESULTS = Path("results")
 # Fail on every environment until base-images releases its nginx fixes. Reported as they are, but not a failed run.
-KNOWN = {"web.proto": "known, #15", "web.websocket": "known, #15", "web.upstream_ipv6": "known, #15"}
+KNOWN = {"web.proto": "known, #15"}
 
 
 def call(method: str, url: str, body: dict | None = None):
