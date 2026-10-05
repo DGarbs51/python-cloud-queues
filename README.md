@@ -9,15 +9,16 @@ It checks the things a real Python app depends on:
 
 | Group | What it checks |
 |---|---|
-| Web | server and process count vs `WEB_CONCURRENCY`, `PORT`, the proxy headers (`X-Forwarded-Proto`, `X-Forwarded-For`, `Cloud-Request-ID`), the async event loop isn't blocked, a WebSocket upgrade through Cloud's proxy (ASGI servers only), and that the pod's nginx reaches the app over IPv6 |
+| Web | server and process count vs `WEB_CONCURRENCY`, `WEB_CONCURRENCY` vs Cloud's sizing formula, `PORT`, the proxy headers (`X-Forwarded-Proto`, `X-Forwarded-For`, `Cloud-Request-ID`), the async event loop isn't blocked, a WebSocket upgrade through Cloud's proxy (ASGI servers only), that the pod's nginx reaches the app over IPv6, that streamed responses (`/api/stream`, server-sent events) arrive as sent with and without `X-Accel-Buffering: no`, and that nginx serves `public/` itself with Cloud's cache headers while refusing dotfiles, logs and SQL dumps |
 | Logging | [laravel-cloud-logging](https://pypi.org/project/laravel-cloud-logging/) is installed, Cloud's log socket is reachable, and (from `cloud_suite.py --tier full`) logs render correctly in Cloud's log viewer |
-| Runtime | Python version vs `.python-version`, outbound HTTPS, `/tmp`, CPU and memory limits, subprocesses, threads |
+| Runtime | Python version vs `.python-version`, the newest patch release and end of life ([endoflife.date](https://endoflife.date/python)), the standard library's C extensions, time-zone data and UTF-8, installed packages vs `uv.lock`, outbound HTTPS, `/tmp`, CPU and memory limits, subprocesses, threads |
 | Services | Valkey/Redis `PING`, database `SELECT 1` (MySQL or Postgres, from `DATABASE_URL`), DNS for both |
 | Queue | seven jobs through [laravel-cloud-queues](https://pypi.org/project/laravel-cloud-queues/): plain, async, delayed, retried, failing, timed out and a burst of 20 |
 | Throughput | N async jobs (default 1,000) through the queue: jobs per second, p95 wait, lost and duplicated jobs |
 
-Checks that only make sense on Cloud (proxy headers, log socket, cgroup limits) are skipped
-when you run locally.
+Checks that only make sense on Cloud (proxy headers, streaming, static files, log socket, cgroup
+limits) are skipped when you run locally. `GET /api/packages` lists this Python, the native
+libraries it's built against (OpenSSL, SQLite, zlib, expat) and every installed package by location.
 
 ## Deploy to Laravel Cloud
 
@@ -157,5 +158,6 @@ uv run python cloud_suite.py --tier full       # on Cloud: everything above, dif
 - `throughput.py`: the throughput test behind `/api/throughput`.
 - `telemetry.py`: job telemetry and the queue check verdicts.
 - `logs.py`: logging setup through laravel-cloud-logging.
+- `public/`: static fixtures the `web.static` check fetches through Cloud's nginx (the repo's `public/` is the webroot).
 - `index.html`: the page (Tailwind from a CDN, no build step).
 - `k6/http.js`: HTTP load script. `solo.yml`: local Web, Worker and test processes for [Solo](https://soloterm.com).

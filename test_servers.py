@@ -78,6 +78,15 @@ def check(server: str) -> None:
                                b"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n")
                     reply = ws.recv(4096)
                 assert reply.startswith(b"HTTP/1.1 101") and b"s3pPLMBiTxaQ9kYGzzhZRbK+xOo=" in reply, reply
+            # /api/stream reaches the client chunk by chunk: the first before the second is sent (#8).
+            conn = http.client.HTTPConnection("::1", port, timeout=10)
+            started = time.monotonic()
+            conn.request("GET", "/api/stream?accel=no")
+            response = conn.getresponse()
+            first = response.readline()
+            assert first.startswith(b"data:") and time.monotonic() - started < 0.9, f"{server} buffered /api/stream"
+            assert response.getheader("x-accel-buffering") == "no"
+            conn.close()
             # The server's own error path logs an exception the app doesn't catch (#17).
             # uWSGI closes the connection without a response instead of sending a 500 (nginx turns it into a 502).
             try:
