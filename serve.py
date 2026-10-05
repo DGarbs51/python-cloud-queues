@@ -33,6 +33,7 @@ COMMANDS = {
     "daphne": "daphne -v 0 --bind :: --port {port} asgi:app",
 }
 SINGLE_PROCESS = {"waitress", "daphne"}
+ASGI = {name for name, command in COMMANDS.items() if "asgi:app" in command}
 
 
 def command(server: str) -> list[str]:
