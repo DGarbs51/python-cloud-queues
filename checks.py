@@ -15,18 +15,23 @@ from __future__ import annotations
 import base64
 import contextvars
 import hashlib
+import http.client
+import importlib.metadata
 import json
 import os
+import platform
 import re
 import socket
 import ssl
 import subprocess
 import sys
+import sysconfig
 import tempfile
 import threading
 import time
 import urllib.request
-from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor
+from datetime import date, datetime, timezone
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
@@ -42,6 +47,8 @@ LOOP_SECONDS: contextvars.ContextVar[float | None] = contextvars.ContextVar("loo
 # asgi.py / wsgi.py set this to the address the request came from: nginx's side of the upstream connection.
 PEER: contextvars.ContextVar[str] = contextvars.ContextVar("peer", default="")
 SUITE_KEY = "lcq-demo:suite:"  # + check id: the latest cloud_suite.py result for a full-tier row
+# Cloudflare's browser integrity check rejects Python's default user agent with 403.
+BROWSER = {"User-Agent": "Mozilla/5.0"}
 USERINFO = re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://)[^\s/@]*@")
 
 Result = tuple[str, str, str]
@@ -113,6 +120,31 @@ def web_server(headers) -> Result:
     if count == wanted:
         return "pass", detail, ""
     return "warn", detail, "The server is running a different number of processes than WEB_CONCURRENCY asks for. A worker may be restarting; reload to check again."
+
+
+def web_concurrency(headers) -> Result:
+    if not on_cloud() or _cgroup("cpu.max") is None:
+        return "skip", "Not on Laravel Cloud, so nothing sets WEB_CONCURRENCY.", CLOUD_ONLY
+    # Cloud's generic Python / WSGI profile (laravel/cloud PythonProfile::webConcurrency), from the inputs Python sees:
+    # cloud-bootstrap caps os.cpu_count() and sysconf at the pod's cgroup limits.
+    cores = os.cpu_count() or 1
+    mib = os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE") // 2**20
+    expected = max(1, min(2 * cores + 1, mib // 150))
+    inputs = f"{cores} vCPU, {mib} MiB, {'cpu' if 2 * cores + 1 <= mib // 150 else 'memory'}-limited; FastAPI would get {max(1, cores)}"
+    quota, period = _cgroup("cpu.max").split()
+    if quota != "max" and cores > -(-int(quota) // int(period)):
+        return "warn", f"os.cpu_count()={cores} is above the cgroup CPU limit ({int(quota) / int(period):g} vCPU)", (
+            "Python sees the node's CPUs, so the cloud-bootstrap capping didn't run (check the build command copies it) "
+            "and the formula's inputs are wrong.")
+    value = os.environ.get("WEB_CONCURRENCY")
+    if not value:
+        return "warn", f"WEB_CONCURRENCY is not set; formula gives {expected} ({inputs})", (
+            "Cloud writes WEB_CONCURRENCY at deploy time from the App instance size. Without an App instance it isn't set.")
+    if int(value) == expected:
+        return "pass", f"WEB_CONCURRENCY={value}, formula gives {expected} ({inputs})", ""
+    return "warn", f"WEB_CONCURRENCY={value}, formula gives {expected} ({inputs})", (
+        "Cloud sizes WEB_CONCURRENCY from the nominal instance size at deploy, while Python sees the pod's cgroup. A mismatch "
+        "means one of them is wrong, the instance was resized without a redeploy, or WEB_CONCURRENCY was set by hand.")
 
 
 def _siblings(parent: int) -> int:
@@ -210,6 +242,122 @@ def web_websocket(headers) -> Result:
         "chat, Django Channels) can't connect. The pod's nginx must forward the Upgrade and Connection headers.")
 
 
+def _arrivals(host: str, path: str) -> list[float]:
+    """Seconds from sending the request until each `data:` line of path arrived."""
+    import app
+
+    # A fully buffered stream arrives only when it ends, STREAM_CHUNKS - 1 seconds in: wait past that.
+    conn = http.client.HTTPSConnection(host, timeout=app.STREAM_CHUNKS + 3, context=ssl.create_default_context())
+    try:
+        started = time.monotonic()
+        conn.request("GET", path, headers=BROWSER)
+        response = conn.getresponse()
+        if response.status != 200:
+            raise RuntimeError(f"{path} answered {response.status}")
+        arrivals: list[float] = []
+        while len(arrivals) < app.STREAM_CHUNKS and (line := response.readline()):
+            if line.startswith(b"data:"):
+                arrivals.append(time.monotonic() - started)
+        return arrivals
+    finally:
+        conn.close()
+
+
+def _streamed(arrivals: list[float]) -> tuple[bool, str]:
+    """(arrived as sent, detail). Chunks leave one a second; as sent = each within 0.5 s of that."""
+    import app
+
+    if len(arrivals) < app.STREAM_CHUNKS:
+        return False, f"{len(arrivals)} of {app.STREAM_CHUNKS} chunks arrived"
+    first = arrivals[0]
+    gap = max(b - a for a, b in zip(arrivals, arrivals[1:]))
+    if first < 1.5 and all(abs(t - first - i) <= 0.5 for i, t in enumerate(arrivals)):
+        verdict = "streamed"
+    elif arrivals[-1] - first < 1:
+        verdict = "buffered: all at once"
+    else:
+        verdict = "in bursts"
+    return verdict == "streamed", f"first chunk at {first:.2f} s, largest gap {gap:.2f} s ({verdict})"
+
+
+def web_streaming(headers) -> Result:
+    if not on_cloud():
+        return "skip", "Not on Laravel Cloud, so no proxy can buffer the response.", CLOUD_ONLY
+    host = _header(headers, "host").split(":")[0]
+    if not host:
+        return "fail", "request has no Host header", FAIL_HELP
+    # Through the public URL, with and without nginx's per-response opt-out, at the same time.
+    with ThreadPoolExecutor(2) as pool:
+        (plain, plain_detail), (opted, opted_detail) = pool.map(
+            lambda path: _streamed(_arrivals(host, path)), ("/api/stream", "/api/stream?accel=no"))
+    detail = f"default: {plain_detail}; with X-Accel-Buffering: no: {opted_detail}"
+    if plain:
+        return "pass", detail, ""
+    if opted:
+        return "warn", detail, (
+            "Cloud's nginx buffers responses, so streamed ones (server-sent events, AI chat, progress) arrive in one piece "
+            "unless the response sends the header X-Accel-Buffering: no. Send it on every streaming response.")
+    return "fail", detail, (
+        "Something between the browser and the app buffers streamed responses even with X-Accel-Buffering: no, "
+        "so server-sent events and AI chat look frozen and then arrive all at once.")
+
+
+PUBLIC = Path(__file__).with_name("public")
+# Fixtures under public/ (#14), with the Cache-Control Cloud's nginx adds by content type (None: no header).
+STATIC = {
+    "cloud-check.txt": None,
+    "static/cloud-check.css": "public, max-age=31536000, immutable",
+    "static/cloud-check.js": "public, max-age=31536000, immutable",
+    "static/cloud-check.png": "private, max-age=86400, stale-while-revalidate=604800",
+    "robots.txt": None,
+    ".well-known/cloud-check.txt": None,
+}
+STATIC_BLOCKED = [".cloud-check-secret", "cloud-check.sql", "cloud-check.log"]  # nginx must refuse these
+
+
+def _get(host: str, path: str) -> tuple[int, dict[str, str], bytes]:
+    conn = http.client.HTTPSConnection(host, timeout=TIMEOUT, context=ssl.create_default_context())
+    try:
+        conn.request("GET", path, headers=BROWSER)
+        response = conn.getresponse()
+        return response.status, {k.lower(): v for k, v in response.getheaders()}, response.read()
+    finally:
+        conn.close()
+
+
+def web_static(headers) -> Result:
+    if not on_cloud():
+        return "skip", "Not on Laravel Cloud, so no nginx serves public/.", CLOUD_ONLY
+    host = _header(headers, "host").split(":")[0]
+    if not host:
+        return "fail", "request has no Host header", FAIL_HELP
+    paths = [*STATIC, *STATIC_BLOCKED, "cloud-check-missing.txt"]
+    with ThreadPoolExecutor(len(paths)) as pool:
+        answers = dict(zip(paths, pool.map(lambda path: _get(host, "/" + path), paths)))
+    broken, cache = [], []
+    # The app has no route for these paths, so the file's exact bytes can only have come from nginx.
+    for path, expected in STATIC.items():
+        status, got, body = answers[path]
+        if status != 200 or body != (PUBLIC / path).read_bytes():
+            broken.append(f"{path}: {status}, {'wrong content' if status == 200 else 'not served'}")
+        elif got.get("cache-control") != expected:
+            cache.append(f"{path}: Cache-Control={got.get('cache-control')}, expected {expected}")
+    for path in STATIC_BLOCKED:
+        status, _, body = answers[path]
+        if status == 200 or (PUBLIC / path).read_bytes().strip() in body:
+            broken.append(f"{path}: {status}, should be blocked (LEAKED)")
+    status, got, body = answers["cloud-check-missing.txt"]
+    if status != 404 or b"not found" not in body or "x-request-id" not in got:
+        broken.append(f"cloud-check-missing.txt: {status}, didn't reach the app")
+    if broken:
+        return "fail", "; ".join(broken + cache), (
+            "nginx should serve files under public/ itself, refuse dotfiles, backups, logs and SQL dumps, and pass "
+            "anything else to the app. A leaked blocked file is a security problem.")
+    if cache:
+        return "warn", "; ".join(cache), "Files are served, but not with the Cache-Control Cloud's nginx sets by content type."
+    return "pass", f"{len(STATIC)} files served by nginx with Cloud's cache headers, {len(STATIC_BLOCKED)} blocked, unknown paths reach the app", ""
+
+
 def web_upstream_ipv6(headers) -> Result:
     if not on_cloud():
         return "skip", "Not on Laravel Cloud, so no nginx sits in front of this app.", CLOUD_ONLY
@@ -270,9 +418,28 @@ def python_version(headers) -> Result:
     if not pinned.is_file():
         return "skip", detail + ", no .python-version file", "Add a .python-version file so the expected Python version is written down."
     wanted = pinned.read_text().strip()
-    if wanted == running or wanted.startswith(running + "."):
-        return "pass", f"{detail}, .python-version is {wanted}", ""
-    return "warn", f"{detail}, .python-version is {wanted}", "The Python running this app is not the one pinned in .python-version. Check the Python version set for this Cloud environment."
+    if not (wanted == running or wanted.startswith(running + ".")):
+        return "warn", f"{detail}, .python-version is {wanted}", "The Python running this app is not the one pinned in .python-version. Check the Python version set for this Cloud environment."
+    detail += f", .python-version is {wanted}"
+    # The newest patch release and end of life for this major.minor (#12).
+    try:
+        with urllib.request.urlopen(f"https://endoflife.date/api/python/{running}.json", timeout=TIMEOUT,
+                                    context=ssl.create_default_context(cafile=certifi.where())) as response:
+            cycle = json.load(response)
+    except Exception as exc:
+        return "pass", f"{detail}; latest-patch comparison skipped ({type(exc).__name__})", ""
+    latest, problems = cycle["latest"], []
+    behind = int(latest.split(".")[2]) - sys.version_info.micro
+    if behind > 0:
+        days = (date.today() - date.fromisoformat(cycle["latestReleaseDate"])).days
+        problems.append(f"latest is {latest} ({behind} release(s) behind; {latest} released {days} days ago)")
+    if isinstance(cycle.get("eol"), str) and date.fromisoformat(cycle["eol"]) <= date.today():
+        problems.append(f"Python {running} reached end of life on {cycle['eol']}")
+    if problems:
+        return "warn", f"{detail}; " + "; ".join(problems), (
+            "Cloud's Python comes from its base image, so a patch release arrives with the next base-image release, and "
+            ".python-version can't pin one (Cloud reads only major.minor). Past end of life there are no security fixes.")
+    return "pass", f"{detail} (latest {running})", ""
 
 
 def outbound_https(headers) -> Result:
@@ -286,6 +453,97 @@ def tmp_writable(headers) -> Result:
         file.write(b"ok")
         file.flush()
     return "pass", "wrote and removed a file in /tmp", ""
+
+
+STDLIB = ["sqlite3", "_sqlite3", "ssl", "_ssl", "hashlib", "_hashlib", "lzma", "_lzma", "bz2", "_bz2", "zlib",
+          "ctypes", "_ctypes", "zoneinfo", "decimal", "_decimal", "uuid", "_uuid"]
+STDLIB_OPTIONAL = ["readline", "curses", "_curses", "dbm", "_dbm", "tkinter", "_tkinter"]  # not needed on a server
+# Run in a child so imports with side effects (readline, tkinter) never touch the web process.
+STDLIB_PROBE = """
+import importlib, json, locale, sys
+missing = {}
+for name in sys.argv[1:]:
+    try:
+        importlib.import_module(name)
+    except Exception as exc:
+        missing[name] = type(exc).__name__
+try:
+    from zoneinfo import ZoneInfo
+    ZoneInfo("America/New_York")
+except Exception as exc:
+    missing["tz data"] = type(exc).__name__
+print(json.dumps(dict(missing=missing, encodings=[sys.getfilesystemencoding(), locale.getpreferredencoding(False)])))
+"""
+
+
+def stdlib_complete(headers) -> Result:
+    out = subprocess.run([sys.executable, "-c", STDLIB_PROBE, *STDLIB, *STDLIB_OPTIONAL], capture_output=True, text=True,
+                         timeout=TIMEOUT, check=True).stdout
+    probe = json.loads(out)
+    native = inventory()["native"]
+    versions = f"OpenSSL {native['openssl'].split()[1]}, SQLite {native['sqlite']}"
+    required = {name: error for name, error in probe["missing"].items() if name not in STDLIB_OPTIONAL}
+    not_utf8 = [e for e in probe["encodings"] if e.lower().replace("-", "") != "utf8"]
+    if required or not_utf8:
+        missing = ", ".join(f"{name} ({error})" for name, error in required.items())
+        return "fail", "; ".join(filter(None, [missing and f"missing: {missing}", not_utf8 and f"encodings: {probe['encodings']}"])), (
+            "Part of the standard library this Python was built without (or text that isn't UTF-8) breaks apps that "
+            "work locally: sqlite3 for Django, ssl and hashlib for HTTPS and passwords, lzma/bz2 for archives.")
+    if probe["missing"]:
+        return "warn", f"{len(STDLIB)} required modules import, tz data and UTF-8 OK, {versions}; optional missing: {', '.join(probe['missing'])}", (
+            "Only modules a server rarely needs are missing (terminal and GUI support).")
+    return "pass", f"{len(STDLIB) + len(STDLIB_OPTIONAL)} modules import, tz data and UTF-8 OK, {versions}", ""
+
+
+def _canonical(name: str) -> str:
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def inventory() -> dict:
+    """GET /api/packages: this Python, the native libraries it's built against, and every installed package by location."""
+    try:
+        import sqlite3
+        sqlite = sqlite3.sqlite_version
+    except ImportError:
+        sqlite = None
+    import pyexpat
+    import zlib
+
+    packages: dict[str, dict[str, str]] = {}
+    for dist in importlib.metadata.distributions():
+        packages.setdefault(str(dist.locate_file("")), {})[_canonical(dist.metadata["Name"])] = dist.version
+    return {
+        "python": dict(version=sys.version, executable=sys.executable, prefix=sys.prefix, platform=platform.platform(),
+                       libc=" ".join(platform.libc_ver()), free_threaded=bool(sysconfig.get_config_var("Py_GIL_DISABLED"))),
+        "native": dict(openssl=ssl.OPENSSL_VERSION, sqlite=sqlite, zlib=zlib.ZLIB_RUNTIME_VERSION, expat=pyexpat.EXPAT_VERSION),
+        "packages": packages,
+    }
+
+
+def packages_match(headers) -> Result:
+    lock = Path(__file__).with_name("uv.lock").read_text()
+    locked = dict(re.findall(r'\[\[package\]\]\nname = "([^"]+)"\nversion = "([^"]+)"', lock))
+    block = re.search(r"^dependencies = \[(.*?)^\]", Path(__file__).with_name("pyproject.toml").read_text(), re.S | re.M)
+    direct = [_canonical(name) for name in re.findall(r'^\s*"([A-Za-z0-9_.-]+)', block.group(1), re.M)]
+    # sys.path order: the first copy of a package is the one imported. A second copy elsewhere is shadowed.
+    found: dict[str, list[tuple[str, str]]] = {}
+    for location, names in inventory()["packages"].items():
+        for name, version in names.items():
+            found.setdefault(name, []).append((version, location))
+    missing = [name for name in direct if name not in found]
+    wrong = [f"{name} {copies[0][0]} (locked {locked[name]})" for name, copies in found.items()
+             if name in locked and copies[0][0] != locked[name]]
+    extra = sorted(f"{name} {copies[0][0]}" for name, copies in found.items() if name not in locked)
+    shadowed = sorted(name for name, copies in found.items() if len({v for v, _ in copies}) > 1)
+    detail = f"{sum(name in locked for name in found)} installed packages match uv.lock" + (
+        f"; not in uv.lock: {', '.join(extra)}" if extra else "")
+    if missing or wrong:
+        return "fail", "; ".join(filter(None, [missing and f"missing: {', '.join(missing)}", wrong and f"wrong version: {', '.join(wrong)}"])), (
+            "The installed packages don't match uv.lock, so the build didn't install what the lock file pins.")
+    if shadowed:
+        return "warn", f"{detail}; installed twice with different versions: {', '.join(shadowed)}", (
+            "A package the image preinstalls shadows (or is shadowed by) the app's copy. Which one imports depends on sys.path.")
+    return "pass", detail, ""
 
 
 def _cgroup(name: str) -> str | None:
@@ -462,6 +720,7 @@ FAIL_HELP = "The check could not complete. See the detail for the error, then ch
 
 CHECKS = [  # (group, id, title, fn, applies, tier); full-tier rows have no fn here: their job is in cloud_suite.JOBS
     ("Web", "web.server", "Server and processes", web_server, everywhere, "quick"),
+    ("Web", "web.concurrency", "WEB_CONCURRENCY matches Cloud's formula", web_concurrency, everywhere, "quick"),
     ("Web", "web.port", "Listening port", web_port, everywhere, "quick"),
     ("Web", "web.proto", "Proxy sends X-Forwarded-Proto: https", _proxy_header("X-Forwarded-Proto", "https"), everywhere, "quick"),
     ("Web", "web.forwarded_for", "Proxy sends X-Forwarded-For", _proxy_header("X-Forwarded-For"), everywhere, "quick"),
@@ -469,10 +728,14 @@ CHECKS = [  # (group, id, title, fn, applies, tier); full-tier rows have no fn h
     ("Web", "web.event_loop", "Async event loop not blocked", web_event_loop, asgi_only, "quick"),
     ("Web", "web.websocket", "WebSocket upgrade through Cloud's proxy", web_websocket, asgi_only, "quick"),
     ("Web", "web.upstream_ipv6", "nginx reaches the app over IPv6", web_upstream_ipv6, everywhere, "quick"),
+    ("Web", "web.streaming", "Streamed responses arrive as sent", web_streaming, everywhere, "quick"),
+    ("Web", "web.static", "Static files served by nginx", web_static, everywhere, "quick"),
     ("Logging", "logging.handler", "Cloud logging handler installed", log_handler, everywhere, "quick"),
     ("Logging", "logging.socket", "Cloud log socket reachable", log_socket, everywhere, "quick"),
     ("Logging", "logging.cloud_viewer", "Logs render in Cloud's log viewer", None, everywhere, "full"),
-    ("Runtime", "runtime.python", "Python version matches .python-version", python_version, everywhere, "quick"),
+    ("Runtime", "runtime.python", "Python version is pinned and current", python_version, everywhere, "quick"),
+    ("Runtime", "runtime.stdlib", "Python standard library complete", stdlib_complete, everywhere, "quick"),
+    ("Runtime", "runtime.packages", "Installed packages match uv.lock", packages_match, everywhere, "quick"),
     ("Runtime", "runtime.https", "Outbound HTTPS", outbound_https, everywhere, "quick"),
     ("Runtime", "runtime.tmp", "/tmp writable", tmp_writable, everywhere, "quick"),
     ("Runtime", "runtime.cpu", "CPU limit", cpu_limit, everywhere, "quick"),
