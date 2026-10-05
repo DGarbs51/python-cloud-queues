@@ -14,7 +14,9 @@ import sys
 import time
 from unittest.mock import patch
 
+import app
 import checks
+import cloud_suite
 
 SECRET = "hunter2-s3cret"
 STATUSES = {"pass", "warn", "fail", "skip"}
@@ -40,19 +42,44 @@ def offline_run(headers: dict, **env: str) -> list[dict]:
 
 
 def main() -> None:
-    rows = {row["id"]: row for row in offline_run({})}
+    # Coverage gate (#19): every entry says where it applies and how heavy it is, and every full-tier
+    # entry has its cloud_suite.py job (and every job an entry), so the runner can't drift from the list.
+    assert all(len(entry) == 6 and callable(entry[4]) and entry[5] in ("quick", "full") for entry in checks.CHECKS)
+    assert all(callable(entry[3]) for entry in checks.CHECKS if entry[5] == "quick")
+    assert all(entry[4] is checks.everywhere or entry[4].__doc__ for entry in checks.CHECKS), "a skip needs its reason"
+    assert {entry[1] for entry in checks.CHECKS if entry[5] == "full"} == set(cloud_suite.JOBS)
+
+    with patch.object(checks, "_redis", return_value=None):
+        rows = {row["id"]: row for row in offline_run({})}
     # Never raises: the stubbed network call becomes a fail row carrying the exception class.
     assert rows["runtime.https"]["status"] == "fail" and rows["runtime.https"]["detail"].startswith("OSError")
-    # WSGI path (LOOP_SECONDS unset) reports the async check as skipped with the fixed help text.
-    assert rows["web.event_loop"]["status"] == "skip" and "Switch to an ASGI server" in rows["web.event_loop"]["help"]
+    # Not an ASGI server (here: none started), so applies() skips the async check with its reason.
+    assert rows["web.event_loop"]["status"] == "skip" and "no event loop" in rows["web.event_loop"]["detail"]
+    # A full-tier row with no suite result yet says how to get one.
+    assert rows["logging.cloud_viewer"]["status"] == "skip"
+    assert "cloud_suite.py --tier full" in rows["logging.cloud_viewer"]["detail"]
     assert rows["runtime.tmp"]["status"] == rows["runtime.subprocess"]["status"] == rows["runtime.threads"]["status"] == "pass"
     assert rows["web.proto"]["status"] == "skip"  # off Cloud
 
     # ASGI path: a measured value passes under 0.5 s and fails over it.
-    for seconds, status in ((0.21, "pass"), (3.0, "fail")):
-        checks.LOOP_SECONDS.set(seconds)
-        assert {r["id"]: r for r in offline_run({})}["web.event_loop"]["status"] == status
+    with patch.object(app, "SERVER", "uvicorn"):
+        for seconds, status in ((0.21, "pass"), (3.0, "fail")):
+            checks.LOOP_SECONDS.set(seconds)
+            assert {r["id"]: r for r in offline_run({})}["web.event_loop"]["status"] == status
     checks.LOOP_SECONDS.set(None)
+    with patch.object(app, "SERVER", "gunicorn"):
+        assert {r["id"]: r for r in offline_run({})}["web.websocket"]["detail"].startswith("Not run on gunicorn")
+
+    # Suite results: cloud_suite.py posts full-tier rows back; the row then shows the latest one.
+    store: dict = {}
+    fake = type("FakeRedis", (), {"get": lambda self, k: store.get(k), "set": lambda self, k, v: store.__setitem__(k, v)})()
+    with patch.object(checks, "_redis", return_value=fake):
+        for bad in ({}, {"web.server": {"status": "pass", "detail": ""}}, {"logging.cloud_viewer": {"status": "ok", "detail": ""}},
+                    {"logging.cloud_viewer": {"status": "pass"}}, {"logging.cloud_viewer": "pass"}):
+            assert checks.save_suite(bad)[0] == 400, bad
+        assert checks.save_suite({"logging.cloud_viewer": {"status": "fail", "detail": "noise: 3 plain line(s)"}})[0] == 200
+        posted = {r["id"]: r for r in offline_run({})}["logging.cloud_viewer"]
+        assert posted["status"] == "fail" and posted["detail"].startswith("noise: 3 plain line(s) (cloud_suite.py, "), posted
 
     # On Cloud the proxy headers are required, matched case-insensitively.
     cloud = {"LARAVEL_CLOUD": "1", "LARAVEL_CLOUD_LOG_SOCKET": "unix:///nonexistent.sock", "WEB_CONCURRENCY": "1"}
@@ -148,10 +175,9 @@ def main() -> None:
             status, detail, _ = checks.memory_limit({})
             assert status == "pass" and "sysconf reports 4096 MiB" in detail, detail
 
-    # WebSocket check: skipped off Cloud and under WSGI; on Cloud a 101 with the right accept key passes.
+    # WebSocket check: skipped off Cloud; on Cloud a 101 with the right accept key passes.
     assert checks.web_websocket({"host": "x"})[0] == "skip"  # LARAVEL_CLOUD unset
     with patch.dict(os.environ, LARAVEL_CLOUD="1"):
-        assert checks.web_websocket({"host": "x"})[0] == "skip"  # LOOP_SECONDS unset: WSGI
 
         class FakeSock:
             def __init__(self, reply):
@@ -170,13 +196,11 @@ def main() -> None:
         key = base64.b64encode(b"k" * 16).decode()
         accept = base64.b64encode(hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest())
         upgraded = b"HTTP/1.1 101 Switching Protocols\r\nSec-WebSocket-Accept: " + accept + b"\r\n\r\n"
-        asgi = checks.LOOP_SECONDS.set(0.2)  # what asgi.py sets under any ASGI server
         for reply, expected in ((upgraded, "pass"), (b"HTTP/1.1 404 Not Found\r\n\r\n", "fail")):
             with patch("os.urandom", return_value=b"k" * 16), \
                     patch("socket.create_connection", return_value=FakeSock(reply)), \
                     patch("ssl.create_default_context", return_value=FakeSock(b"")):
                 assert checks.web_websocket({"Host": "app.example"})[0] == expected
-        checks.LOOP_SECONDS.reset(asgi)
 
         # IPv6 upstream: ::1 passes, 127.0.0.1 warns.
         for peer, expected in (("::1", "pass"), ("127.0.0.1", "warn"), ("::ffff:127.0.0.1", "warn"), ("10.0.0.9", "warn")):
@@ -193,11 +217,12 @@ def main() -> None:
     assert time.monotonic() - started < 15
 
     # Through the router (handle) under the sync/WSGI path.
-    import app
     with patch("urllib.request.urlopen", side_effect=OSError("offline")):
         status, _, body = app.handle("GET", "/api/checks", {}, b"")
     assert status == 200
     check_shape(json.loads(body))
+    status, _, body = app.handle("POST", "/api/suite-results", {"Content-Type": "application/json"}, b'{"web.server": {}}')
+    assert status == 400, body
     print("checks contract passed")
 
 
