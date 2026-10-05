@@ -19,6 +19,7 @@ from pathlib import Path
 
 import checks
 import logs_check
+import upload_check
 
 RESULTS = Path("results")
 # Fail on every environment until base-images releases its nginx fixes. Reported as they are, but not a failed run.
@@ -46,7 +47,7 @@ def cloud_viewer(env: str, url: str) -> tuple[str, str, dict]:
 
 
 # Full-tier jobs by registry id: (env name, env URL) -> (status, detail, metrics). Higher metrics are worse.
-JOBS = {"logging.cloud_viewer": cloud_viewer}
+JOBS = {"logging.cloud_viewer": cloud_viewer, "web.upload_limit": lambda env, url: upload_check.score(upload_check.probe(url))}
 
 
 def run_env(env: str, url: str, tier: str) -> dict:
