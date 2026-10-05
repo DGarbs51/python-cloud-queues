@@ -367,11 +367,18 @@ def web_static(headers) -> Result:
 def web_upstream_ipv6(headers) -> Result:
     if not on_cloud():
         return "skip", "Not on Laravel Cloud, so no nginx sits in front of this app.", CLOUD_ONLY
+    import app
+
     peer = PEER.get()
     # A dual-stack listener (`--host ::`) sees an IPv4 client as ::ffff:127.0.0.1; it is still IPv4.
     peer = peer.removeprefix("::ffff:")
     if peer == "::1":
         return "pass", "nginx reaches the app over IPv6 (::1)", ""
+    # uvicorn's proxy headers replace the peer with X-Forwarded-For when the connection comes from a trusted address,
+    # by default 127.0.0.1 and ::1. On its `--host ::` listener nginx's IPv4 arrives as ::ffff:127.0.0.1, which isn't
+    # trusted, so a rewritten peer (the client nginx saw, X-Real-IP) means nginx connected from ::1.
+    if app.SERVER == "uvicorn" and peer and peer == _header(headers, "x-real-ip"):
+        return "pass", "nginx reaches the app over IPv6 (::1); uvicorn replaced the peer with X-Forwarded-For", ""
     if peer == "127.0.0.1":
         return "warn", "nginx reaches the app over IPv4 (127.0.0.1)", (
             "This app works because it listens on both IPv4 and IPv6, but an app that listens on IPv6 only "
