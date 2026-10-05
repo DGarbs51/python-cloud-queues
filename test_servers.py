@@ -107,6 +107,10 @@ def check(server: str) -> None:
             chunks = [b"u" * 65536] * (size // 65536) + [b"u" * (size % 65536)]
             upload = {"Content-Type": "application/octet-stream"}
             assert json.loads(request(port, "POST", "/api/upload", b"".join(chunks), upload)[2]) == {"bytes": size}
+            # hypercorn's WSGI wrapper buffers the body and answers an empty 400 above its 16 MiB wsgi_max_body_size.
+            over = request(port, "POST", "/api/upload", b"u" * (16 * 1024 * 1024 + 1), upload)
+            expected = (400, b"") if server == "hypercorn-wsgi" else (200, b'{"bytes": 16777217}')
+            assert (over[0], over[2]) == expected, f"{server} 16 MiB + 1 upload: {over[0]} {over[2][:80]}"
             chunked = {**upload, "Transfer-Encoding": "chunked"}
             status, _, body = request(port, "POST", "/api/upload", [b"u"] if server == "uwsgi" else chunks, chunked)
             expected = (400, {"error": "invalid Content-Length"}) if server == "uwsgi" else (200, {"bytes": size})

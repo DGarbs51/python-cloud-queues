@@ -28,7 +28,8 @@ UNSIZED = EDGE + MiB  # sent without a Content-Length: the edge counts the strea
 
 
 def layer(status: int, body: bytes) -> str:
-    """Who answered: the app's JSON, or nginx's or Cloudflare's HTML error page (both say server: cloudflare)."""
+    """Who answered: the app's JSON, nginx's or Cloudflare's HTML error page (both say server: cloudflare), or the
+    web server itself with an empty body (hypercorn's WSGI wrapper above its 16 MiB wsgi_max_body_size)."""
     try:
         json.loads(body)
         return "app"
@@ -37,7 +38,7 @@ def layer(status: int, body: bytes) -> str:
     for name in ("cloudflare", "nginx"):
         if f"<center>{name}</center>".encode() in body:
             return name
-    return "unknown" if status else "none"
+    return "none" if not status else "server" if not body.strip() else "unknown"
 
 
 def upload(url: str, path: Path, size: int, sized: bool = True) -> dict:
@@ -94,9 +95,12 @@ def score(rows: list[dict]) -> tuple[str, str, dict]:
     if truncated:
         cut = ", ".join(f"{human(r['size'])} -> {r['bytes']} B" for r in truncated)
         detail = f"TRUNCATED {cut}; " + detail
-    expected = largest == EDGE and first and first["size"] == EDGE + 1 and first["layer"] == "cloudflare" and (
-        not unsized or (unsized["status"], unsized["layer"]) == (413, "cloudflare"))
-    return ("pass" if expected and not truncated else "fail"), detail, {"truncated": len(truncated)}
+    edge = [r for r in (first, unsized) if r]
+    expected = largest == EDGE and first and first["size"] == EDGE + 1 and all(r["layer"] == "cloudflare" for r in edge)
+    if not expected or truncated:
+        return "fail", detail, {"truncated": len(truncated)}
+    # Cloudflare sometimes answers an over-limit upload with its own 502 instead of 413 (about 1 in 7): same limit.
+    return ("pass" if all(r["status"] == 413 for r in edge) else "warn"), detail, {"truncated": 0}
 
 
 def self_check() -> None:
@@ -112,9 +116,14 @@ def self_check() -> None:
     assert (status, metrics["truncated"]) == ("fail", 1) and detail.startswith("TRUNCATED 25 MB -> 5 B"), detail
     status, detail, _ = score([*good[:5], r(200 * MB, 413, where="nginx"), *good[6:]])
     assert status == "fail" and "200 MB: 413 from nginx" in detail, detail  # a lower limit, from another layer
+    status, detail, _ = score([*good[:-2], r(EDGE + 1, 502, where="cloudflare"), good[-1]])
+    assert status == "warn" and "524288001 B: 502 from cloudflare" in detail, detail
+    status, detail, _ = score([*good[:2], *(r(s, 400, where="server") for s in SIZES[2:-1]), *good[-2:]])
+    assert status == "fail" and detail.startswith("largest 10 MB") and "25 MB: 400 from server" in detail, detail
     status, detail, _ = score([*good[:-1], r(UNSIZED, 200, sized=False)])
     assert status == "fail" and "without Content-Length: 200 from app" in detail, detail  # the edge let it through
     assert layer(413, b"<hr><center>cloudflare</center>") == "cloudflare" and layer(0, b"") == "none"
+    assert layer(400, b"") == "server" and layer(400, b"oops") == "unknown"
     assert layer(400, b'{"error": "x"}') == "app" and layer(413, b"<center>nginx</center>") == "nginx"
     print("upload_check self-check passed")
 
