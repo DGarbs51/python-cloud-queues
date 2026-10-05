@@ -32,7 +32,7 @@ HEADERS = {"User-Agent": "Mozilla/5.0"}
 EXPECTED_LEVELS = {"info": "info", "notice": "info", "warning": "warning", "error": "error",
                    "critical": "error", "alert": "error", "emergency": "error"}
 assert set(EXPECTED_LEVELS) | {"debug"} == set(LOG_TEST_LEVELS)
-# Known, reported server behaviour for an uncaught exception in a request. Still exactly one error entry.
+# Known server behaviour for an uncaught exception in a request. Still exactly one error entry.
 KNOWN_UNCAUGHT = {
     "server-uwsgi": "uWSGI closes the connection without a response, so nginx answers 502",
 }
@@ -130,6 +130,11 @@ def check(env: str, url: str, since: datetime | None) -> dict:
     for name, tag, code in (("uncaught", f"{marker}-boom", boom_status), ("thread", f"{marker}-thread", thread_status)):
         hits = [e for e in window if f"uncaught boom {tag}" in json.dumps(e)]
         good = [e for e in hits if e.get("type") == "exception" and e.get("level") == "error" and (e.get("data") or {}).get("trace")]
+        if name == "uncaught":
+            # laravel-cloud-logging 0.3.1 logs it from its middleware (logger 'uncaught', 'Uncaught exception in GET
+            # /path', with cloud_request_id) and drops the server's copy. The API drops logger, message and context,
+            # but the trace shows who caught it: its outermost frame is the middleware's, not the server's.
+            good = [e for e in good if "laravel_cloud_logging/" in e["data"]["trace"][-1]]
         # The request must still be answered: a 500 from the server, not a dropped connection (nginx 502).
         status_ok = code == 500 if name == "uncaught" else code == 200
         detail = f"HTTP {code}; {len(hits)} entries: " + ", ".join(f"{e.get('type')}/{e.get('level')}" for e in hits)
