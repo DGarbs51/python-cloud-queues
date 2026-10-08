@@ -2,8 +2,8 @@
 // Not evidence for the in-flight trigger; that is concurrency.js.
 //   k6 cloud run -e ROUTE=ping|redis|cpu [-e RATE=<peak req/s>] ... k6/throughput.js
 // Defaults: ping 400/s, redis 300/s, cpu 50/s. Caps: maxVUs 300 / 300 / 150, wall-clock 1800 s.
-// VUh upper bound = maxVUs x 25 min / 60: ping 125, redis 125, cpu 62.5 (VUH_CAP defaults to 150).
-import { CLOUD, SAFETY, begin, end, get } from './lib.js';
+// VUh upper bound = (maxVUs + 5 for the stats sampler) x 25 min / 60: ping 127, redis 127, cpu 65 (VUH_CAP 150).
+import { CLOUD, SAFETY, begin, end, get, sampleStats, statsScenario } from './lib.js';
 
 const ROUTES = { ping: [400, 300], redis: [300, 300], cpu: [50, 150] }; // [peak req/s, maxVUs]
 const ROUTE = __ENV.ROUTE;
@@ -22,6 +22,7 @@ export const scenarios = {
       { duration: '5m', target: 0 },
     ],
   },
+  stats: statsScenario('25m'),
 };
 
 export const options = { scenarios, thresholds: SAFETY, cloud: { name: `throughput ${ROUTE} ${__ENV.ENV_NAME} pass ${__ENV.PASS}`, distribution: CLOUD.distribution } };
@@ -32,6 +33,10 @@ export function setup() {
 
 export function hit() {
   get(`/api/${ROUTE}`, WALL_CAP_S);
+}
+
+export function stats() {
+  sampleStats(WALL_CAP_S);
 }
 
 export function teardown(run) {

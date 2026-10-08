@@ -68,5 +68,19 @@ export function get(path, cap, name) {
   return res;
 }
 
+// One GET /api/stats every 10 s beside the load, for the answering pod's loop_lag_ms {p50, p99}. Logged per sample,
+// because a k6 metric can't hold the JSON. Each sample comes from whichever pod answered.
+export function statsScenario(duration, startTime = '0s') {
+  return { executor: 'constant-arrival-rate', exec: 'stats', rate: 1, timeUnit: '10s', duration, startTime,
+    preAllocatedVUs: 2, maxVUs: 5, gracefulStop: '30s' };
+}
+
+export function sampleStats(cap) {
+  const res = get('/api/stats', cap, '/api/stats');
+  if (res.status === 200) {
+    console.log(`k6-stats ${JSON.stringify({ at: new Date().toISOString(), server: res.json('server'), loop_lag_ms: res.json('loop_lag_ms') })}`);
+  }
+}
+
 // Stop early when most requests fail: a blocked edge or a dead environment costs VUh for nothing.
 export const SAFETY = { http_req_failed: [{ threshold: 'rate<0.5', abortOnFail: true, delayAbortEval: '60s' }] };

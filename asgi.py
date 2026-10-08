@@ -55,11 +55,15 @@ async def app(scope: dict, receive, send) -> None:
         uploaded = 0
         while uploaded <= app_module.UPLOAD_MAX:
             message = await receive()
+            if message["type"] == "http.disconnect":
+                return  # the client hung up mid-body: nothing to answer, and a partial body must not run a route
             uploaded += len(message.get("body", b""))
             if not message.get("more_body"):
                 break
     while uploaded is None:
         message = await receive()
+        if message["type"] == "http.disconnect":
+            return
         body += message.get("body", b"")
         if len(body) > app_module.MAX_BODY:
             too_large = True
@@ -80,8 +84,9 @@ async def app(scope: dict, receive, send) -> None:
             disconnect.cancel()
             if not handler.done():
                 handler.cancel()
-        if not handler.done():
-            return
+                # Let the cancellation finish, so no Redis or DB call outlives the request.
+                await asyncio.gather(handler, return_exceptions=True)
+                return
         status, headers, payload = handler.result()  # re-raises Boom for the server's error path
     await send({"type": "http.response.start", "status": status,
                 "headers": [(k.lower().encode("latin-1"), v.encode("latin-1")) for k, v in headers]})

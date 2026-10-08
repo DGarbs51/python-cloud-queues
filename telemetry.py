@@ -58,7 +58,9 @@ class Telemetry:
         url = self._url()
         if not url:
             raise RuntimeError("Attach a Valkey cache (REDIS_URL) to store demo telemetry.")
-        return redis.Redis.from_url(url, decode_responses=True)
+        # Timeouts bound a stalled Valkey: async jobs call this on the worker's loop, where a hang would stop the
+        # lease renewer (laravel-cloud-queues renews async handlers from a task, not a thread).
+        return redis.Redis.from_url(url, decode_responses=True, socket_connect_timeout=TIMEOUT, socket_timeout=TIMEOUT)
 
     async def aopen(self) -> None:
         """Create the request-loop client; apps can boot without an attached cache."""
