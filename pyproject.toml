@@ -2,21 +2,24 @@
 name = "python-cloud-queues"
 version = "0.0.0"
 description = "Plain-Python app that checks whether Python works on a Laravel Cloud deployment."
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 dependencies = [
     "laravel-cloud-queues[redis]>=0.2.2",
     "pymysql",
     "certifi",
     "gunicorn",
-    "uvicorn",
+    "uvicorn[standard]",
     "laravel-cloud-logging==0.3.1",
     "psycopg[binary]>=3.3.6",
     "websockets>=16.1.1",
     "granian>=2.8.4",
-    "hypercorn>=0.18.0",
+    "hypercorn[uvloop]>=0.18.0",
     "daphne>=4.2.3",
     "waitress>=3.0.2",
     "pyuwsgi>=2.0.30.post1",
+    "psycopg-pool>=3.3.3",
+    "asyncmy>=0.2.16",
+    "httpx>=0.28.1",
 ]
 
 [tool.uv]
