@@ -1,6 +1,7 @@
 """Ship main to every environment: merge it into each environment's branch, push, and wait for the deploys.
 
 Run: uv run python scripts/ship.py [env ...]
+Environments named k6-* (load tests) are skipped unless named on the command line.
 Merges origin/main into each branch in a scratch worktree, so your checkout is untouched. On a conflict main
 wins, except for the branch's own .python-version or .web-server; anything else (e.g. a deleted file) stops
 the run. Then waits until every environment's latest deployment is at its branch head and finished, and exits 1
@@ -55,8 +56,12 @@ def merge(branch: str, tree: str) -> str:
     return git("rev-parse", "HEAD", cwd=tree).stdout.strip()
 
 
+def selected(name: str, named: list[str]) -> bool:
+    return name in named if named else not name.startswith("k6-")  # k6-* only when named: a run may be in progress
+
+
 def main() -> None:
-    envs = {e["name"]: (e["id"], e["branch"]) for e in cloud("env:list", APP) if not sys.argv[1:] or e["name"] in sys.argv[1:]}
+    envs = {e["name"]: (e["id"], e["branch"]) for e in cloud("env:list", APP) if selected(e["name"], sys.argv[1:])}
     git("fetch", "-q", "origin")
     tree = tempfile.mkdtemp(prefix="ship-")
     git("worktree", "add", "-q", "--detach", tree, "origin/main")
