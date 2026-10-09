@@ -16,7 +16,9 @@ from pathlib import Path
 # Logging flags follow laravel-cloud-logging's server table. logging.json is written by the Cloud build command
 # `laravel-cloud-logging-config logging.json`, so main-process lines (boot, workers, shutdown) are JSON too.
 COMMANDS = {
-    "uvicorn": "uvicorn asgi:app --host :: --port {port} --log-config logging.json",
+    # Async-first ASGI: uvloop + httptools set explicitly, not left to auto-detection.
+    "uvicorn": "uvicorn asgi:app --host :: --port {port} --loop uvloop --http httptools "
+               "--timeout-graceful-shutdown {grace} --log-config logging.json",
     "gunicorn": "gunicorn wsgi:app --bind [::]:{port}",
     # --lazy-apps: import the app in each worker, not once in the master before forking.
     "uwsgi": "uwsgi --http-socket [::]:{port} --module wsgi:app --master --processes {workers} --lazy-apps "
@@ -25,13 +27,20 @@ COMMANDS = {
     # It also deletes X-Forwarded-* from untrusted proxies; keep them, as the other servers do.
     "waitress": "waitress-serve --listen=[::]:{port} --listen=0.0.0.0:{port} --no-clear-untrusted-proxy-headers wsgi:app",
     "granian-wsgi": "granian --interface wsgi --host :: --port {port} --workers {workers} --log-config logging.json wsgi:app",
-    "granian-asgi": "granian --interface asgi --host :: --port {port} --workers {workers} --log-config logging.json asgi:app",
+    # --runtime-mode auto picks mt for any non-RSGI interface; st keeps one loop per worker. --backpressure is
+    # explicit so granian's backlog/workers default can't cap in-flight requests below what a load test drives.
+    "granian-asgi": "granian --interface asgi --host :: --port {port} --workers {workers} --loop uvloop "
+                    "--runtime-mode st --backpressure 1024 --workers-kill-timeout {grace} "
+                    "--log-config logging.json asgi:app",
     # json: prefix, or hypercorn reads the file as INI.
     "hypercorn-wsgi": "hypercorn --bind [::]:{port} --workers {workers} --log-config json:logging.json wsgi:app",
-    "hypercorn-asgi": "hypercorn --bind [::]:{port} --workers {workers} --log-config json:logging.json asgi:app",
+    "hypercorn-asgi": "hypercorn --bind [::]:{port} --workers {workers} --worker-class uvloop "
+                      "--graceful-timeout {grace} --log-config json:logging.json asgi:app",
     # -v 0: daphne prints its access log straight to stdout; Cloud's nginx already logs each request.
     "daphne": "daphne -v 0 --bind :: --port {port} asgi:app",
 }
+# Seconds a server waits for in-flight requests on SIGTERM: under Cloud's 30 s budget minus its 5 s pre-drain.
+GRACE = 20
 SINGLE_PROCESS = {"waitress", "daphne"}
 ASGI = {name for name, command in COMMANDS.items() if "asgi:app" in command}
 
@@ -39,7 +48,7 @@ ASGI = {name for name, command in COMMANDS.items() if "asgi:app" in command}
 def command(server: str) -> list[str]:
     port = os.environ.get("PORT", "8000")
     workers = os.environ.get("WEB_CONCURRENCY", "1")
-    return COMMANDS[server].format(port=port, workers=workers).split()
+    return COMMANDS[server].format(port=port, workers=workers, grace=GRACE).split()
 
 
 if __name__ == "__main__":
