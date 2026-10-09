@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import contextvars
 import hashlib
 import http.client
@@ -912,8 +913,11 @@ async def aweb_event_loop(headers) -> Result:
 async def _close_writer(writer) -> None:
     writer.close()
     if not asyncio.current_task().cancelling():
-        async with asyncio.timeout(TIMEOUT):
-            await writer.wait_closed()
+        # The answer is already read. A peer still sending (daphne's separate final chunk lands after our
+        # close_notify) makes the TLS shutdown raise APPLICATION_DATA_AFTER_CLOSE_NOTIFY: not the check's failure.
+        with contextlib.suppress(ssl.SSLError, ConnectionError):
+            async with asyncio.timeout(TIMEOUT):
+                await writer.wait_closed()
 
 
 async def aweb_websocket(headers) -> Result:
