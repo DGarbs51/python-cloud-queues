@@ -28,7 +28,7 @@ reads to pick the web server). `main` is Python 3.14 on uvicorn.
 
 | Branch | Python | Web server |
 |---|---|---|
-| `python-3.10` … `python-3.14` | 3.10 … 3.14 | uvicorn |
+| `python-3.11` … `python-3.14` | 3.11 … 3.14 | uvicorn |
 | `server-gunicorn`, `server-uwsgi`, `server-waitress` | `main`'s | WSGI |
 | `server-granian-wsgi`, `server-hypercorn-wsgi` | `main`'s | WSGI |
 | `server-granian-asgi`, `server-hypercorn-asgi`, `server-daphne` | `main`'s | ASGI |
@@ -159,6 +159,18 @@ k6 run -e BASE_URL=https://your-app.laravel.cloud k6/http.js
 It ramps to 50 virtual users and fails if more than 1% of requests fail or p95 latency is over
 500 ms.
 
+The Grafana Cloud k6 load tests (`k6 cloud run`, one load zone near us-east-2) hit the `k6-*` environments, which
+`ship.py` and `cloud_suite.py` skip unless you name them. Every request sends `X-K6-Bypass` from `K6_BYPASS`, and each
+script has a `maxVUs`, wall-clock and VUh cap (see its header):
+
+```sh
+uv run python k6/run.py --cloud k6/probe.js -e BASE_URL=https://<k6 host> -e ENV_NAME=k6-uvicorn -e K6_BYPASS=<secret> \
+  -e SIZE=pro.m-1vcpu-4gb -e WEB_CONCURRENCY=1 -e THRESHOLDS=A -e COMMIT=<env branch sha>
+# also k6/concurrency.js (-e PASS=A|B; 85, 100 and 115 req/s steps of 120 s around 95 in flight, then 30/s for 360 s) and k6/throughput.js (-e PASS=A|B -e ROUTE=ping|redis|cpu)
+```
+
+`k6/run.py` appends each run's UTC window and every `-e` value except `K6_BYPASS` to `results/k6/runs.jsonl`; `--cloud` needs `SIZE`, `WEB_CONCURRENCY` and `THRESHOLDS`, without it the run is a local `k6 run`.
+
 ## Tests
 
 ```sh
@@ -183,4 +195,4 @@ uv run python cloud_suite.py --tier full       # on Cloud: everything above, dif
 - `logs.py`: logging setup through laravel-cloud-logging.
 - `public/`: static fixtures the `web.static` check fetches through Cloud's nginx (the repo's `public/` is the webroot).
 - `index.html`: the page (Tailwind from a CDN, no build step).
-- `k6/http.js`: HTTP load script. `solo.yml`: local Web, Worker and test processes for [Solo](https://soloterm.com).
+- `k6/http.js`: HTTP load script. `k6/{probe,concurrency,throughput}.js`, `k6/lib.js`, `k6/run.py`: the Cloud load tests. `solo.yml`: local Web, Worker and test processes for [Solo](https://soloterm.com).

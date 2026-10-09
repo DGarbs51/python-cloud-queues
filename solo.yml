@@ -51,8 +51,8 @@ processes:
     auto_restart: false
     restart_when_changed: []
     env: {}
-  test 3.10 + 3.14:
-    command: uv run --python 3.10 python test_servers.py && uv run --python 3.14 python test_servers.py
+  test 3.11 + 3.14:
+    command: uv run --python 3.11 python test_servers.py && uv run --python 3.14 python test_servers.py
     working_dir: null
     auto_start: false
     auto_restart: false

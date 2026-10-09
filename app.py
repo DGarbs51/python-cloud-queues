@@ -4,12 +4,14 @@ Web (ASGI): uvicorn asgi:app --host :: --port $PORT
 Web (WSGI): gunicorn wsgi:app --bind [::]:$PORT
 Worker:     laravel-cloud-queues work app:registry
 
-Both web entrypoints route through handle() here, so they serve the same pages and checks.
+wsgi.py routes through handle() here; asgi.py has its own async router. Both share the
+validation, response and logging helpers below, so they serve the same pages and checks.
 """
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -30,7 +32,7 @@ from laravel_cloud_queues import Registry, current_job
 import checks
 import logs
 import throughput
-from telemetry import BURST_SIZE, CHECK_DEADLINE, CHECK_KINDS, DELAY_SECONDS, TIMEOUT_SECONDS, Telemetry
+from telemetry import BURST_SIZE, CHECK_DEADLINE, CHECK_KINDS, DELAY_SECONDS, KEY_PREFIX, TIMEOUT_SECONDS, Telemetry
 
 # The queue CLI imports app:registry, so a worker process is the one running `work`.
 LOG_ROLE = "worker" if "work" in sys.argv else "web"
@@ -53,6 +55,8 @@ SLOW_MAX = 300  # /api/slow cap in seconds: above Cloud's 60 s HTTP timeout, so 
 # /api/upload's own cap (#10): above Cloudflare's 500 MiB edge limit, so the edge is what an upload test hits first.
 UPLOAD_MAX = 512 * 1024 * 1024
 UPLOAD_CHUNK = 1024 * 1024
+CPU_ROUNDS = 100_000  # /api/cpu: chained sha256 rounds, ~20 ms on one core; fixed so every run does the same work
+REDIS_HITS = KEY_PREFIX + "redis-hits"  # /api/redis INCRs this
 
 
 class Boom(Exception):
@@ -120,7 +124,19 @@ def dispatch(kind: str) -> list[str]:
     return uuids
 
 
-CHECK_LOCK = "lcq-demo:check-lock"
+async def adispatch(kind: str) -> list[str]:
+    job, delay, count = DISPATCHES[kind]
+
+    async def one() -> str:
+        at = time.time()
+        receipt = await job.options(delay=delay).dispatch_async()
+        await telemetry.aqueued(job.name, receipt.uuid, at, delay)
+        return receipt.uuid
+
+    return list(await asyncio.gather(*(one() for _ in range(count))))
+
+
+CHECK_LOCK = KEY_PREFIX + "check-lock"
 
 
 def run_check() -> bool:
@@ -132,6 +148,15 @@ def run_check() -> bool:
     if not telemetry.store.set(CHECK_LOCK, "1", nx=True, ex=CHECK_DEADLINE):
         return False
     telemetry.save_check({kind: dispatch(kind) for kind in CHECK_KINDS})
+    return True
+
+
+async def arun_check() -> bool:
+    """run_check() for the ASGI path: the same lock, every case dispatched concurrently."""
+    if not await telemetry.astore.set(CHECK_LOCK, "1", nx=True, ex=CHECK_DEADLINE):
+        return False
+    uuids = await asyncio.gather(*(adispatch(kind) for kind in CHECK_KINDS))
+    await telemetry.asave_check(dict(zip(CHECK_KINDS, uuids)))
     return True
 
 
@@ -151,33 +176,54 @@ def _reject_constant(value: str):
     raise ValueError(f"invalid JSON constant: {value}")
 
 
+def header(headers: Mapping[str, str], name: str) -> str:
+    return next((v for k, v in headers.items() if k.lower() == name), "")
+
+
+def request_id(headers: Mapping[str, str]) -> str:
+    supplied = header(headers, "x-request-id")
+    return supplied if re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", supplied) else uuid.uuid4().hex
+
+
+def failed(method: str, path: str) -> Response:
+    """The response for an exception a route didn't handle (Boom escapes before this)."""
+    log.exception("Request failed: %s %s", method, path)
+    return json_response(503, {"error": "service unavailable"})
+
+
+def finish(method: str, path: str, response: Response, started: float, request_id: str) -> Response:
+    """Write the one access log line and add X-Request-ID. Call inside logs.context(request_id=...)."""
+    status, headers, payload = response
+    # Dashboard polling would drown the log at INFO.
+    level = logging.DEBUG if method == "GET" and path == "/api/stats" else logging.INFO
+    if status >= 400:
+        level = logging.ERROR if status >= 500 else logging.WARNING
+    log.log(level, "access", extra=dict(method=method, path=path, status=status, bytes=len(payload),
+                                        duration_ms=round((time.monotonic() - started) * 1000, 2)))
+    return status, [*headers, ("X-Request-ID", request_id)], payload
+
+
 def handle(method: str, path: str, headers: Mapping[str, str], body: bytes, uploaded: int | None = None) -> Response:
-    """Route one request. Adds X-Request-ID and writes one access log line.
+    """Route one request (WSGI). Adds X-Request-ID and writes one access log line.
 
     uploaded: POST /api/upload's body size, counted by asgi.py / wsgi.py instead of passing the body (#10).
     """
-    started = time.monotonic()
-    supplied = next((v for k, v in headers.items() if k.lower() == "x-request-id"), "")
-    request_id = supplied if re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", supplied) else uuid.uuid4().hex
-    path, query = urlsplit(path).path, urlsplit(path).query
-    with logs.context(request_id=request_id):
+    started, rid, (path, query) = time.monotonic(), request_id(headers), urlsplit(path)[2:4]
+    with logs.context(request_id=rid):
         try:
-            status, response_headers, payload = _handle(method, path, query, headers, body, uploaded)
+            response = _handle(method, path, query, headers, body, uploaded)
         except Boom:
             raise
         except Exception:
-            log.exception("Request failed: %s %s", method, path)
-            status, response_headers, payload = json_response(503, {"error": "service unavailable"})
-        # Dashboard polling would drown the log at INFO.
-        level = logging.DEBUG if method == "GET" and path == "/api/stats" else logging.INFO
-        if status >= 400:
-            level = logging.ERROR if status >= 500 else logging.WARNING
-        log.log(level, "access", extra=dict(method=method, path=path, status=status, bytes=len(payload),
-                                            duration_ms=round((time.monotonic() - started) * 1000, 2)))
-    return status, [*response_headers, ("X-Request-ID", request_id)], payload
+            response = failed(method, path)
+        return finish(method, path, response, started, rid)
 
 
-def _handle(method: str, path: str, query: str, headers: Mapping[str, str], body: bytes, uploaded: int | None) -> Response:
+def validate(method: str, path: str, headers: Mapping[str, str], body: bytes, uploaded: int | None) -> Response | dict:
+    """Upload counting, the body cap and POST's JSON object, for both routers.
+
+    Returns the response when that ends the request, else the POST body ({} for other methods).
+    """
     if method == "POST" and path == "/api/upload" and uploaded is not None:
         # Side-effect free, so any Content-Type is fine: the upload limit test (#10) posts raw bytes.
         if uploaded < 0:
@@ -189,7 +235,7 @@ def _handle(method: str, path: str, query: str, headers: Mapping[str, str], body
         return json_response(400, {"error": "body exceeds 64 KiB"})
     if method == "POST":
         # JSON forces a CORS preflight, so other sites cannot trigger dispatches.
-        content_type = next((v for k, v in headers.items() if k.lower() == "content-type"), "")
+        content_type = header(headers, "content-type")
         if content_type.split(";", 1)[0].strip() != "application/json":
             return json_response(415, {"error": "expected application/json"})
         try:
@@ -198,27 +244,68 @@ def _handle(method: str, path: str, query: str, headers: Mapping[str, str], body
             data = None
         if not isinstance(data, dict):
             return json_response(400, {"error": "expected a JSON object"})
+        return data
+    return {}
+
+
+def slow_seconds(query: str) -> int | None:
+    seconds = next((v for k, v in parse_qsl(query) if k == "seconds"), "")
+    return int(seconds) if seconds.isdigit() and 1 <= int(seconds) <= SLOW_MAX else None
+
+
+SLOW_INVALID = json_response(400, {"error": f"seconds must be 1-{SLOW_MAX}"})
+
+
+def _handle(method: str, path: str, query: str, headers: Mapping[str, str], body: bytes, uploaded: int | None) -> Response:
+    data = validate(method, path, headers, body, uploaded)
+    if isinstance(data, tuple):
+        return data
     if method == "GET":
-        if path == "/":
-            content = INDEX.read_bytes()
-            return 200, [("Content-Type", "text/html; charset=utf-8"), ("Content-Length", str(len(content)))], content
-        if path == "/api/ping":
-            return json_response(200, {"ok": True, **instance()})
         if path == "/api/slow":
-            # Blocks this worker (WSGI) or a thread off the event loop (ASGI), like a real slow request (#7, #9).
-            seconds = next((v for k, v in parse_qsl(query) if k == "seconds"), "")
-            if not seconds.isdigit() or not 1 <= int(seconds) <= SLOW_MAX:
-                return json_response(400, {"error": f"seconds must be 1-{SLOW_MAX}"})
-            time.sleep(int(seconds))
-            return json_response(200, {"ok": True, "slept": int(seconds), **instance()})
+            # Blocks this worker, like a real slow request (#7, #9). asgi.py awaits asyncio.sleep instead.
+            if (seconds := slow_seconds(query)) is None:
+                return SLOW_INVALID
+            time.sleep(seconds)
+            return json_response(200, {"ok": True, "slept": seconds, **instance()})
         if path == "/api/stats":
             return json_response(200, {**telemetry.snapshot(), "server": SERVER})
+        if path == "/api/redis":
+            return json_response(200, {"ok": True, "hits": telemetry.store.incr(REDIS_HITS), **instance()})
         if path == "/api/checks":
             return json_response(200, checks.run(headers))
         if path == "/api/packages":
             return json_response(200, checks.inventory())
         if path.startswith("/api/throughput/"):
             return json_response(*throughput.status(path.removeprefix("/api/throughput/")))
+    elif method == "POST":
+        if path == "/api/check":
+            if not run_check():
+                return json_response(409, {"error": "a queue check is already running"})
+            return json_response(200, {"ok": True})
+        if path == "/api/throughput":
+            return json_response(*throughput.start(data))
+        if path == "/api/suite-results":
+            return json_response(*checks.save_suite(data))
+        if path == "/api/reset":
+            telemetry.reset()
+            return json_response(200, {"ok": True})
+    return route(method, path, query)
+
+
+def route(method: str, path: str, query: str) -> Response:
+    """The routes with no I/O to wait on, for both routers; 404 for anything else."""
+    if method == "GET":
+        if path == "/":
+            content = INDEX.read_bytes()
+            return 200, [("Content-Type", "text/html; charset=utf-8"), ("Content-Length", str(len(content)))], content
+        if path == "/api/ping":
+            return json_response(200, {"ok": True, **instance()})
+        if path == "/api/cpu":
+            # Holds the worker (and the event loop on ASGI) for fixed CPU work: the load tests' CPU-bound route.
+            digest = b"lcq"
+            for _ in range(CPU_ROUNDS):
+                digest = hashlib.sha256(digest).digest()
+            return json_response(200, {"ok": True, "rounds": CPU_ROUNDS, "digest": digest.hex(), **instance()})
         if path in ("/api/log-test", "/api/boom", "/api/boom-thread"):
             marker = next((v for k, v in parse_qsl(query) if k == "marker"), "")
             if not MARKER.fullmatch(marker):
@@ -232,18 +319,6 @@ def _handle(method: str, path: str, query: str, headers: Mapping[str, str], body
                 thread.start()
                 thread.join()
             return json_response(200, {"ok": True, "marker": marker})
-    elif method == "POST":
-        if path == "/api/check":
-            if not run_check():
-                return json_response(409, {"error": "a queue check is already running"})
-            return json_response(200, {"ok": True})
-        if path == "/api/throughput":
-            return json_response(*throughput.start(data))
-        if path == "/api/suite-results":
-            return json_response(*checks.save_suite(data))
-        if path == "/api/reset":
-            telemetry.reset()
-            return json_response(200, {"ok": True})
     return json_response(404, {"error": "not found"})
 
 
