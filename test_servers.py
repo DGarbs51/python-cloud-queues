@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import http.client
 import json
+import math
 import os
 import signal
 import socket
@@ -16,6 +17,7 @@ import sys
 import tempfile
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from serve import ASGI, COMMANDS, SINGLE_PROCESS
@@ -44,6 +46,45 @@ def request(port, method, path, body=b"", headers=None, host="::1"):
 
 # Servers that finish a request in flight when SIGTERM arrives (#7).
 DRAINS = {"uvicorn", "gunicorn", "granian-wsgi", "granian-asgi"}
+# While the burst is in flight, /api/ping must answer within this at the 99th percentile (seconds).
+# Client-side, so it includes the test's own thread scheduling. Parked on the event loop it is a few ms;
+# queued behind /api/slow in the default executor it is about a second.
+PING_P99_MAX = 0.25
+
+
+def concurrency_gate(server: str, port: int, workers: int) -> None:
+    """An ASGI server holds more concurrent /api/slow?seconds=1 than asyncio.to_thread's default executor can run.
+
+    That executor has min(32, cpus + 4) threads per worker process: a burst past workers x threads can only
+    finish in one second if /api/slow waits on the event loop, not in a thread. /api/ping during the burst is
+    the event-loop lag: a blocked or saturated loop shows up as a slow ping.
+    """
+    threads = min(32, (getattr(os, "process_cpu_count", os.cpu_count)() or 1) + 4)
+    burst = max(100, 2 * threads * workers)
+    pings: list[float] = []
+    done = threading.Event()
+
+    def sample() -> None:
+        while not done.is_set():
+            started = time.monotonic()
+            assert request(port, "GET", "/api/ping")[0] == 200
+            pings.append(time.monotonic() - started)
+            time.sleep(0.01)
+
+    sampler = threading.Thread(target=sample)
+    with ThreadPoolExecutor(burst) as pool:
+        started = time.monotonic()
+        calls = [pool.submit(request, port, "GET", "/api/slow?seconds=1") for _ in range(burst)]
+        sampler.start()
+        statuses = [call.result()[0] for call in calls]
+        elapsed = time.monotonic() - started
+    done.set()
+    sampler.join()
+    assert statuses == [200] * burst, f"{server} burst: {sorted(set(statuses))}"
+    assert elapsed < 1.5, f"{server}: {burst} concurrent /api/slow?seconds=1 took {elapsed:.2f} s, want < 1.5 s"
+    assert pings, f"{server}: /api/ping never answered during the burst"
+    p99 = sorted(pings)[math.ceil(0.99 * len(pings)) - 1]
+    assert p99 < PING_P99_MAX, f"{server}: /api/ping p99 {p99 * 1000:.0f} ms over {len(pings)} samples during the burst"
 
 
 def check(server: str) -> None:
@@ -117,6 +158,8 @@ def check(server: str) -> None:
             assert (status, json.loads(body)) == expected, f"{server} chunked upload: {status} {body}"
             big = b"x" * (64 * 1024 + 1)
             assert request(port, "POST", "/api/check", big, {"Content-Type": "application/json"})[0] == 400
+            if server in ASGI:
+                concurrency_gate(server, port, 1 if server in SINGLE_PROCESS else 2)
             # SIGTERM with a slow request in flight: a draining server finishes it before exiting (#7).
             slow: list = []
 
