@@ -142,6 +142,7 @@
       if (stats.server) bits.push(`server: ${stats.server}`);
       bits.push(`queue mode: ${stats.mode}`);
       if (stats.queue) bits.push(`queue: ${stats.queue}`);
+      if (stats.loop_lag_ms) bits.push(`loop lag p50/p99: ${stats.loop_lag_ms.p50}/${stats.loop_lag_ms.p99} ms`);
       $("env").textContent = bits.join(" · ");
     }
 

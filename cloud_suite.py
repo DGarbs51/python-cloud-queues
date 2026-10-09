@@ -1,6 +1,7 @@
 """Regression suite (#19): every registered check on every environment, saved and diffed against the last run.
 
 Run: uv run python cloud_suite.py --tier quick|full [env ...]
+Environments named k6-* (load tests) are skipped unless named.
 quick reads GET /api/checks from every environment in parallel. full also runs each full-tier entry's job
 (JOBS below, Cloud CLI) where it applies, and posts the result back so the page's row shows it.
 Writes results/<UTC time>.json, compares it with the previous file of the same tier and exits 1 on any
@@ -136,7 +137,7 @@ def main() -> None:
     parser.add_argument("envs", nargs="*")
     args = parser.parse_args()
     urls = {e["name"]: e["url"] for e in logs_check.cloud("env:list", logs_check.APP)}
-    envs = args.envs or sorted(urls)
+    envs = args.envs or sorted(name for name in urls if not name.startswith("k6-"))  # a k6 run may be in progress
     started = datetime.now(timezone.utc)
     with ThreadPoolExecutor(len(envs)) as pool:
         results = dict(zip(envs, pool.map(lambda env: safe_run(env, urls[env], args.tier), envs)))

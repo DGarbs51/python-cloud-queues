@@ -5,14 +5,20 @@ Run: uv run --env-file .env python test_checks.py
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import json
 import os
 import subprocess
 import sys
+import threading
 import time
-from unittest.mock import patch
+from contextlib import asynccontextmanager
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock, patch
+
+import httpx
 
 import app
 import checks
@@ -39,6 +45,215 @@ def offline_run(headers: dict, **env: str) -> list[dict]:
     with patch.dict(os.environ, env), patch("urllib.request.urlopen", side_effect=OSError("offline")), \
             patch("socket.getaddrinfo", return_value=[("addr",)]):
         return check_shape(checks.run(headers))
+
+
+async def async_checks() -> None:
+    # The whole registry keeps the sync shape; the event-loop measurement runs here, without a router seed.
+    def response(request):
+        if request.url.host == "endoflife.date":
+            return httpx.Response(200, json={"latest": f"{checks.python_minor()}.{sys.version_info.micro}", "eol": "2999-01-01"})
+        return httpx.Response(200, content=b"ok")
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(response))
+    with patch.dict(os.environ, LARAVEL_CLOUD="", DATABASE_URL="", REDIS_URL="", LARAVEL_CLOUD_QUEUES_REDIS_URL=""), \
+            patch.object(app, "SERVER", "uvicorn"), patch("checks.httpx.AsyncClient", return_value=http):
+        await checks.aopen()
+        try:
+            rows = {row["id"]: row for row in check_shape(await checks.arun({}))}
+            assert rows["web.event_loop"]["status"] == rows["runtime.https"]["status"] == "pass", rows
+            assert rows["services.database"]["status"] == rows["services.redis"]["status"] == "skip"
+            assert checks.LOOP_SECONDS.get() is None
+            with patch("tempfile.NamedTemporaryFile", side_effect=PermissionError("read-only")):
+                broken = {row["id"]: row for row in check_shape(await checks.arun({}))}
+            assert broken["runtime.tmp"]["detail"] == "PermissionError: read-only"
+            assert broken["runtime.threads"]["status"] == "pass"
+        finally:
+            await checks.aclose()
+    assert http.is_closed and checks._http is None
+    assert checks.SUITE_KEY == checks.telemetry.KEY_PREFIX + "suite:"
+
+    # Gather children inherit request context and actually overlap; one failure is isolated and scrubbed.
+    arrived, ready = [], asyncio.Event()
+    async def probe(headers):
+        assert checks.PEER.get() == "::1" and headers == {"test": "request"}
+        arrived.append(True)
+        if len(arrived) == 2:
+            ready.set()
+        await ready.wait()
+        return "pass", "overlapped", ""
+
+    entries = [("Web", id, id, None, checks.everywhere, "quick") for id in ("test.a", "test.b")]
+    token = checks.PEER.set("::1")
+    try:
+        with patch.object(checks, "CHECKS", entries), patch.object(checks, "ASYNC_CHECKS", dict.fromkeys(("test.a", "test.b"), probe)), \
+                patch.object(checks, "DEADLINE", 0.5):
+            result = await checks.arun({"test": "request"})
+        assert [row["status"] for row in result["groups"][0]["checks"]] == ["pass", "pass"]
+    finally:
+        checks.PEER.reset(token)
+
+    async def fail(headers):
+        raise RuntimeError(f"mysql://app:{SECRET}@db.example/x ({SECRET})")
+    with patch.dict(os.environ, DATABASE_URL=f"mysql://app:{SECRET}@db.example/x"), \
+            patch.object(checks, "CHECKS", entries), \
+            patch.object(checks, "ASYNC_CHECKS", {"test.a": fail, "test.b": AsyncMock(return_value=("pass", "ok", ""))}):
+        result = await checks.arun({})
+    assert SECRET not in json.dumps(result)
+    assert [row["status"] for row in result["groups"][0]["checks"]] == ["fail", "pass"]
+
+    # A deadline cancels the stalled probe; disconnect-style cancellation propagates to every child.
+    started, stopped = asyncio.Event(), []
+    async def hang(headers):
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            stopped.append(True)
+    with patch.object(checks, "CHECKS", entries[:1]), patch.object(checks, "ASYNC_CHECKS", {"test.a": hang}), \
+            patch.object(checks, "DEADLINE", 0.05):
+        result = await checks.arun({})
+    row = result["groups"][0]["checks"][0]
+    assert row["status"] == "fail" and row["detail"] == "no answer within 0.05 s" and stopped == [True], row
+    started.clear()
+    with patch.object(checks, "CHECKS", entries[:1]), patch.object(checks, "ASYNC_CHECKS", {"test.a": hang}):
+        task = asyncio.create_task(checks.arun({}))
+        await started.wait()
+        task.cancel()
+        try:
+            await task
+            assert False, "arun swallowed cancellation"
+        except asyncio.CancelledError:
+            pass
+    assert stopped == [True, True]
+
+    # A failed network sibling leaves no detached probe behind.
+    started.clear()
+    async def fail_after_start():
+        await started.wait()
+        raise OSError("offline")
+    try:
+        await checks._agather(hang({}), fail_after_start())
+        assert False, "gather lost its error"
+    except OSError:
+        pass
+    assert stopped == [True, True, True]
+
+    # Timed-out thread probes stay guarded until the thread finishes, including across sync runs.
+    release, entered = threading.Event(), threading.Event()
+    def sync_probe(headers):
+        assert checks.PEER.get() == "::1"
+        entered.set()
+        release.wait(2)
+        return "pass", "finished", ""
+    entry = ("Runtime", "test.thread", "thread", sync_probe, checks.everywhere, "quick")
+    token = checks.PEER.set("::1")
+    try:
+        with patch.object(checks, "CHECKS", [entry]), patch.object(checks, "SYNC_PROBES", {sync_probe}), \
+                patch.object(checks, "DEADLINE", 0.05):
+            result = await checks.arun({})
+            assert entered.is_set() and result["groups"][0]["checks"][0]["status"] == "fail"
+            assert (await checks.arun({}))["groups"][0]["checks"][0]["status"] == "warn"
+            assert checks.run({})["groups"][0]["checks"][0]["status"] == "warn"
+    finally:
+        release.set()
+        checks.PEER.reset(token)
+    async with asyncio.timeout(1):
+        while "test.thread" in checks._running:
+            await asyncio.sleep(0.01)
+
+    # Full-tier saves use async Redis, preserve validation, and round-trip the same rows/keys.
+    saved = {}
+    async def get(key):
+        return saved.get(key)
+    async def set_row(key, value):
+        saved[key] = value
+    client = SimpleNamespace(get=get, set=set_row)
+    with patch.object(checks, "_aredis", return_value=client):
+        for bad in ({}, {"web.server": {"status": "pass", "detail": ""}}, {"logging.cloud_viewer": {"status": "ok", "detail": ""}}):
+            assert (await checks.asave_suite(bad))[0] == 400
+        assert (await checks.asave_suite({"logging.cloud_viewer": {"status": "fail", "detail": "noise"}}))[0] == 200
+        status, detail, _ = await checks.asuite_result("logging.cloud_viewer")
+        assert status == "fail" and detail.startswith("noise (cloud_suite.py, ")
+    assert set(saved) == {checks.SUITE_KEY + "logging.cloud_viewer"}
+    with patch.object(checks, "_aredis", return_value=None):
+        assert (await checks.asave_suite({"logging.cloud_viewer": {"status": "pass", "detail": "ok"}}))[0] == 503
+
+    # Lifecycle pools are lazy/bounded; TLS modes and query timeout survive the async conversion.
+    cursor = SimpleNamespace(execute=AsyncMock(), fetchone=AsyncMock(return_value=(1,)))
+    @asynccontextmanager
+    async def cursor_context():
+        yield cursor
+    conn = SimpleNamespace(cursor=cursor_context)
+    @asynccontextmanager
+    async def connection_context():
+        yield conn
+    for verify in ("1", "0"):
+        pool = SimpleNamespace(open=AsyncMock(), close=AsyncMock(), connection=connection_context)
+        with patch.dict(os.environ, LARAVEL_CLOUD="1", DATABASE_URL=f"postgresql://u:{SECRET}@db.example/x", DB_SSL_VERIFY=verify), \
+                patch("psycopg_pool.AsyncConnectionPool", return_value=pool) as factory:
+            await checks.aopen()
+            options = factory.call_args.kwargs
+            assert options["max_size"] == 5 and options["min_size"] == 0
+            assert options["kwargs"]["host"] == "db.example"  # the attached host, never rewritten
+            assert options["kwargs"]["prepare_threshold"] is None
+            assert options["kwargs"]["sslmode"] == ("verify-full" if verify == "1" else "require")
+            assert "statement_timeout=5000" in options["kwargs"]["options"]
+            if verify == "1":
+                assert options["kwargs"]["sslrootcert"] == checks.certifi.where()
+            assert (await checks.adatabase_query({}))[0] == "pass"
+            await checks.aclose()
+        pool.open.assert_awaited_once()
+        pool.close.assert_awaited_once()
+        pool = SimpleNamespace(close=Mock(), wait_closed=AsyncMock(), acquire=connection_context)
+        with patch.dict(os.environ, DATABASE_URL=f"mysql://u:{SECRET}@db.example/x", DB_SSL_VERIFY=verify), \
+                patch("asyncmy.create_pool", AsyncMock(return_value=pool)) as factory:
+            await checks.aopen()
+            options = factory.call_args.kwargs
+            assert options["maxsize"] == 5 and options["minsize"] == 0
+            assert options["ssl"].verify_mode == (checks.ssl.CERT_REQUIRED if verify == "1" else checks.ssl.CERT_NONE)
+            assert options["ssl"].check_hostname == (verify == "1")
+            assert options["read_timeout"] == checks.TIMEOUT
+            assert (await checks.adatabase_query({}))[0] == "pass"
+            await checks.aclose()
+        pool.close.assert_called_once()
+        pool.wait_closed.assert_awaited_once()
+    assert cursor.execute.await_count == 4
+    assert all(call.args == ("SELECT 1",) for call in cursor.execute.await_args_list)
+
+    # Malformed configuration stays confined to the database row instead of aborting lifespan.
+    with patch.dict(os.environ, DATABASE_URL="mysql://[broken"):
+        await checks.aopen()
+        entry = next(entry for entry in checks.CHECKS if entry[1] == "services.database")
+        assert (await checks._aone(entry, {}))["status"] == "fail"
+        await checks.aclose()
+
+    # TLS socket probes read actual HTTP framing, including chunk boundaries that split SSE lines.
+    def stream(data):
+        reader = asyncio.StreamReader()
+        reader.feed_data(data)
+        reader.feed_eof()
+        writer = SimpleNamespace(write=Mock(), drain=AsyncMock(), close=Mock(), wait_closed=AsyncMock())
+        return reader, writer
+    key = base64.b64encode(b"k" * 16).decode()
+    accept = base64.b64encode(hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest())
+    upgraded = b"HTTP/1.1 101 Switching Protocols\r\nSec-WebSocket-Accept: " + accept + b"\r\n\r\n"
+    with patch.dict(os.environ, LARAVEL_CLOUD="1"), patch("os.urandom", return_value=b"k" * 16):
+        for reply, expected in ((upgraded, "pass"), (b"HTTP/1.1 404 Not Found\r\n\r\n", "fail")):
+            reader, writer = stream(reply)
+            with patch("asyncio.open_connection", AsyncMock(return_value=(reader, writer))) as connect:
+                assert (await checks.aweb_websocket({"Host": "app.example"}))[0] == expected
+            assert connect.call_args.kwargs["ssl"].check_hostname
+            writer.close.assert_called_once()
+        chunks = [b"da", b"ta: 0\n\n", *(f"data: {i}\n\n".encode() for i in range(1, app.STREAM_CHUNKS))]
+        for chunked in (False, True):
+            data = (b"".join(f"{len(chunk):x}\r\n".encode() + chunk + b"\r\n" for chunk in chunks) + b"0\r\n\r\n"
+                    if chunked else b"".join(chunks))
+            head = b"HTTP/1.1 200 OK\r\n" + (b"Transfer-Encoding: chunked\r\n" if chunked else b"") + b"\r\n"
+            reader, writer = stream(head + data)
+            with patch("asyncio.open_connection", AsyncMock(return_value=(reader, writer))):
+                arrivals = await checks._aarrivals("app.example", "/api/stream")
+            assert len(arrivals) == app.STREAM_CHUNKS and arrivals == sorted(arrivals)
+            writer.close.assert_called_once()
 
 
 def main() -> None:
@@ -231,6 +446,20 @@ def main() -> None:
     with patch.dict(os.environ, LARAVEL_CLOUD="1", WEB_CONCURRENCY="5"), patch.object(checks, "_cgroup", {"cpu.max": "200000 100000"}.get), \
             patch("os.cpu_count", return_value=16):
         assert "above the cgroup CPU limit" in checks.web_concurrency({})[1]  # the bootstrap didn't run
+    with patch.dict(os.environ, LARAVEL_CLOUD="1", WEB_CONCURRENCY="1"), patch.object(app, "SERVER", "uvicorn"), \
+            patch.object(checks, "_cgroup", {"cpu.max": "100000 100000"}.get), patch("os.cpu_count", return_value=1), \
+            patch("os.sysconf", lambda name: 4096 if name == "SC_PAGE_SIZE" else 4096 * mib):
+        status, detail, _ = checks.web_concurrency({})
+        assert status == "pass" and "WEB_CONCURRENCY=1, hand-set" in detail and "formula gives 3" in detail
+    with patch.dict(os.environ, LARAVEL_CLOUD="1", WEB_CONCURRENCY="2"), patch.object(app, "SERVER", "uvicorn"), \
+            patch.object(checks, "_cgroup", {"cpu.max": "100000 100000"}.get), patch("os.cpu_count", return_value=1), \
+            patch("os.sysconf", lambda name: 4096 if name == "SC_PAGE_SIZE" else 4096 * mib):
+        status, detail, _ = checks.web_concurrency({})  # neither the formula nor one per core: still a warning
+        assert status == "warn" and "hand-set override" in detail
+    with patch.dict(os.environ, LARAVEL_CLOUD="1", WEB_CONCURRENCY="1"), patch.object(app, "SERVER", "gunicorn"), \
+            patch.object(checks, "_cgroup", {"cpu.max": "100000 100000"}.get), patch("os.cpu_count", return_value=1), \
+            patch("os.sysconf", lambda name: 4096 if name == "SC_PAGE_SIZE" else 4096 * mib):
+        assert checks.web_concurrency({})[0] == "warn"  # WSGI has no hand-set exception
 
     # Streaming (#8): six chunks a second apart; scored on when they arrive.
     assert checks._streamed([0.1, 1.1, 2.1, 3.1, 4.1, 5.1]) == (True, "first chunk at 0.10 s, largest gap 1.00 s (streamed)")
@@ -315,8 +544,13 @@ def main() -> None:
              ({**real["packages"], image: {"setuptools": "79.0.1", "pip": "24.0"}}, "pass"),
              ({image: {"setuptools": "79.0.1"}, **real["packages"]}, "pass"),  # 3.11: the app needs no setuptools
              ({image: {"certifi": "1999.1.1"}, **real["packages"]}, "warn"))
+    read_text = checks.Path.read_text
+    def fixture_text(path, *args, **kwargs):
+        content = read_text(path, *args, **kwargs)
+        return content + '\n[[package]]\nname = "websockets"\nversion = "16.1.1"\n' if path.name == "uv.lock" else content
     for packages, expected in cases:
-        with patch.object(checks, "inventory", return_value=dict(real, packages=packages)):
+        with patch.object(checks, "inventory", return_value=dict(real, packages=packages)), \
+                patch.object(checks.Path, "read_text", fixture_text):
             status, detail, _ = checks.packages_match({})
         assert status == expected, (expected, detail)
     status, _, body = app.handle("GET", "/api/packages", {}, b"")
@@ -334,6 +568,7 @@ def main() -> None:
     check_shape(json.loads(body))
     status, _, body = app.handle("POST", "/api/suite-results", {"Content-Type": "application/json"}, b'{"web.server": {}}')
     assert status == 400, body
+    asyncio.run(async_checks())
     print("checks contract passed")
 
 

@@ -2,7 +2,7 @@
 
 Each check is a small function returning (status, detail, help); CHECKS lists them in display order.
 run() never raises: a check that throws becomes a fail row, every detail is scrubbed of credentials,
-and the checks run in parallel daemon threads under a 12 s deadline.
+and the checks run in parallel under a 12 s deadline (async tasks or WSGI daemon threads).
 
 CHECKS is the one registry the page, /api/checks and cloud_suite.py share (#19). Each entry has
 applies(server, python), false where the check doesn't fit (the row is a skip with the reason), and a tier:
@@ -12,6 +12,7 @@ back, and the row shows that.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import contextvars
 import hashlib
@@ -36,17 +37,19 @@ from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
 import certifi
+import httpx
 
 import serve
+import telemetry
 
 TIMEOUT = 5
 LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
 CLOUD_ONLY = "Only checked on Laravel Cloud."
-# asgi.py sets this to the measured seconds for 50 concurrent 0.2 s sleeps; unset means WSGI.
+# The async check measures 50 concurrent 0.2 s sleeps; sync callers may supply a measurement.
 LOOP_SECONDS: contextvars.ContextVar[float | None] = contextvars.ContextVar("loop_seconds", default=None)
 # asgi.py / wsgi.py set this to the address the request came from: nginx's side of the upstream connection.
 PEER: contextvars.ContextVar[str] = contextvars.ContextVar("peer", default="")
-SUITE_KEY = "lcq-demo:suite:"  # + check id: the latest cloud_suite.py result for a full-tier row
+SUITE_KEY = telemetry.KEY_PREFIX + "suite:"  # + check id: the latest cloud_suite.py result for a full-tier row
 # Cloudflare's browser integrity check rejects Python's default user agent with 403.
 BROWSER = {"User-Agent": "Mozilla/5.0"}
 USERINFO = re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://)[^\s/@]*@")
@@ -123,6 +126,8 @@ def web_server(headers) -> Result:
 
 
 def web_concurrency(headers) -> Result:
+    import app
+
     if not on_cloud() or _cgroup("cpu.max") is None:
         return "skip", "Not on Laravel Cloud, so nothing sets WEB_CONCURRENCY.", CLOUD_ONLY
     # Cloud's generic Python / WSGI profile (laravel/cloud PythonProfile::webConcurrency), from the inputs Python sees:
@@ -142,7 +147,11 @@ def web_concurrency(headers) -> Result:
             "Cloud writes WEB_CONCURRENCY at deploy time from the App instance size. Without an App instance it isn't set.")
     if int(value) == expected:
         return "pass", f"WEB_CONCURRENCY={value}, formula gives {expected} ({inputs})", ""
-    return "warn", f"WEB_CONCURRENCY={value}, formula gives {expected} ({inputs})", (
+    if app.SERVER in serve.ASGI and int(value) == max(1, cores):
+        # Set by hand on the async environments: one worker per whole core. Cloud has no ASGI case to compare with.
+        return "pass", (f"WEB_CONCURRENCY={value}, hand-set; Cloud's generic Python formula gives {expected} ({inputs}). "
+                        "Cloud has no ASGI case for a non-FastAPI app"), ""
+    return "warn", f"generic Python formula gives {expected} ({inputs}); WEB_CONCURRENCY={value} differs (a hand-set override may explain it)", (
         "Cloud sizes WEB_CONCURRENCY from the nominal instance size at deploy, while Python sees the pod's cgroup. A mismatch "
         "means one of them is wrong, the instance was resized without a redeploy, or WEB_CONCURRENCY was set by hand.")
 
@@ -233,6 +242,10 @@ def web_websocket(headers) -> Result:
             if not chunk:
                 break
             response += chunk
+    return _websocket_result(host, key, response)
+
+
+def _websocket_result(host: str, key: str, response: bytes) -> Result:
     status_line = response.split(b"\r\n", 1)[0].decode(errors="replace")
     accept = base64.b64encode(hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()).decode()
     if " 101 " in status_line + " " and accept.encode() in response:
@@ -290,6 +303,12 @@ def web_streaming(headers) -> Result:
     with ThreadPoolExecutor(2) as pool:
         (plain, plain_detail), (opted, opted_detail) = pool.map(
             lambda path: _streamed(_arrivals(host, path)), ("/api/stream", "/api/stream?accel=no"))
+    return _streaming_result((plain, plain_detail), (opted, opted_detail))
+
+
+def _streaming_result(plain_result, opted_result) -> Result:
+    plain, plain_detail = plain_result
+    opted, opted_detail = opted_result
     detail = f"default: {plain_detail}; with X-Accel-Buffering: no: {opted_detail}"
     # The documented opt-out is what apps rely on; buffering without it (uWSGI's --http-socket, SE-303) is expected.
     if plain or opted:
@@ -336,6 +355,10 @@ def web_static(headers) -> Result:
     paths = [*STATIC, *STATIC_BLOCKED, "cloud-check-missing.txt"]
     with ThreadPoolExecutor(len(paths)) as pool:
         answers = dict(zip(paths, pool.map(lambda path: _get(host, "/" + path), paths)))
+    return _static_result(answers)
+
+
+def _static_result(answers) -> Result:
     broken, cache = [], []
     # The app has no route for these paths, so the file's exact bytes can only have come from nginx.
     for path in STATIC:
@@ -424,7 +447,7 @@ def log_socket(headers) -> Result:
 PATCH_LAG_DAYS = 30
 
 
-def python_version(headers) -> Result:
+def _python_pin() -> str | Result:
     running = f"{sys.version_info.major}.{sys.version_info.minor}"
     detail = f"running Python {sys.version.split()[0]}"
     pinned = Path(__file__).with_name(".python-version")
@@ -433,7 +456,14 @@ def python_version(headers) -> Result:
     wanted = pinned.read_text().strip()
     if not (wanted == running or wanted.startswith(running + ".")):
         return "warn", f"{detail}, .python-version is {wanted}", "The Python running this app is not the one pinned in .python-version. Check the Python version set for this Cloud environment."
-    detail += f", .python-version is {wanted}"
+    return detail + f", .python-version is {wanted}"
+
+
+def python_version(headers) -> Result:
+    detail = _python_pin()
+    if not isinstance(detail, str):
+        return detail
+    running = python_minor()
     # The newest patch release and end of life for this major.minor (#12).
     try:
         with urllib.request.urlopen(f"https://endoflife.date/api/python/{running}.json", timeout=TIMEOUT,
@@ -441,6 +471,11 @@ def python_version(headers) -> Result:
             cycle = json.load(response)
     except Exception as exc:
         return "pass", f"{detail}; latest-patch comparison skipped ({type(exc).__name__})", ""
+    return _python_release(detail, cycle)
+
+
+def _python_release(detail: str, cycle: dict) -> Result:
+    running = python_minor()
     latest, notes, problems = cycle["latest"], [], []
     behind = int(latest.split(".")[2]) - sys.version_info.micro
     if behind > 0:
@@ -641,39 +676,58 @@ def redis_ping(headers) -> Result:
     return "pass", "PING returned PONG", ""
 
 
-def database_query(headers) -> Result:
+def _database_options() -> tuple[str, dict] | None:
     database = _database()
     if database is None:
-        return "skip", "DATABASE_URL is not set", "Attach a database to this environment to test it."
+        return None
     kind, host, port = database
     parts = urlsplit(os.environ["DATABASE_URL"])
     user, password, name = unquote(parts.username or ""), unquote(parts.password or ""), parts.path.lstrip("/")
     tls = host not in LOCAL_HOSTS
     verify = os.environ.get("DB_SSL_VERIFY") != "0"
     if kind == "mysql":
-        import pymysql
-
         context = None
         if tls:
             context = ssl.create_default_context(cafile=certifi.where())
             if not verify:  # Cloud's ProxySQL certificate is self-signed: encrypted, not authenticated
                 context.check_hostname, context.verify_mode = False, ssl.CERT_NONE
-        conn = pymysql.connect(host=host, port=port, user=user, password=password, database=name or None,
-                               ssl=context, connect_timeout=TIMEOUT, read_timeout=TIMEOUT)
+        options = dict(host=host, port=port, user=user, password=password, database=name or None,
+                       ssl=context, connect_timeout=TIMEOUT, read_timeout=TIMEOUT)
     else:
-        import psycopg
-
         extra = {}
         if tls:
             extra = dict(sslmode="verify-full", sslrootcert=certifi.where()) if verify else dict(sslmode="require")
-        conn = psycopg.connect(host=host, port=port, user=user, password=password, dbname=name or None,
-                               connect_timeout=TIMEOUT, options=f"-c statement_timeout={TIMEOUT * 1000}", **extra)
+        options = dict(host=host, port=port, user=user, password=password, dbname=name or None,
+                       connect_timeout=TIMEOUT, options=f"-c statement_timeout={TIMEOUT * 1000}", **extra)
+    return kind, options
+
+
+def _database_result(kind: str, options: dict) -> Result:
+    host, port = options["host"], options["port"]
+    tls = host not in LOCAL_HOSTS
+    verify = os.environ.get("DB_SSL_VERIFY") != "0"
+    security = ("TLS, certificate not verified" if not verify else "TLS") if tls else "no TLS (local host)"
+    return "pass", f"SELECT 1 on {kind} at {host}:{port}, {security}", ""
+
+
+def database_query(headers) -> Result:
+    configured = _database_options()
+    if configured is None:
+        return "skip", "DATABASE_URL is not set", "Attach a database to this environment to test it."
+    kind, options = configured
+    if kind == "mysql":
+        import pymysql
+
+        conn = pymysql.connect(**options)
+    else:
+        import psycopg
+
+        conn = psycopg.connect(**options)
     with conn:
         cursor = conn.cursor()
         cursor.execute("SELECT 1")
         assert tuple(cursor.fetchone()) == (1,)
-    security = ("TLS, certificate not verified" if not verify else "TLS") if tls else "no TLS (local host)"
-    return "pass", f"SELECT 1 on {kind} at {host}:{port}, {security}", ""
+    return _database_result(kind, options)
 
 
 def dns_hosts(headers) -> Result:
@@ -708,6 +762,10 @@ def suite_result(id: str) -> Result:
     """The latest result cloud_suite.py posted for a full-tier row."""
     client = _redis()
     saved = client.get(SUITE_KEY + id) if client is not None else None
+    return _suite_result(saved)
+
+
+def _suite_result(saved) -> Result:
     if not saved:
         return "skip", "run `cloud_suite.py --tier full`", (
             "This check needs the Cloud CLI, so cloud_suite.py runs it from outside the app and posts the result here.")
@@ -716,18 +774,336 @@ def suite_result(id: str) -> Result:
         "Run `uv run python cloud_suite.py --tier full <environment>` for the full report.")
 
 
-def save_suite(data: dict) -> tuple[int, dict]:
-    """POST /api/suite-results: {check id: {"status", "detail"}} for full-tier rows, from cloud_suite.py."""
+def _suite_error(data: dict) -> tuple[int, dict] | None:
     full = {entry[1] for entry in CHECKS if entry[5] == "full"}
     if not data or not all(id in full and isinstance(row, dict) and row.get("status") in ("pass", "warn", "fail", "skip")
                            and isinstance(row.get("detail"), str) for id, row in data.items()):
         return 400, {"error": f"expected {{check id: {{status, detail}}}} for {', '.join(sorted(full))}"}
+
+
+def save_suite(data: dict) -> tuple[int, dict]:
+    """POST /api/suite-results: {check id: {"status", "detail"}} for full-tier rows, from cloud_suite.py."""
+    error = _suite_error(data)
+    if error:
+        return error
     client = _redis()
     if client is None:
         return 503, {"error": "REDIS_URL is not set"}
     at = f"{datetime.now(timezone.utc):%Y-%m-%d %H:%M} UTC"
     for id, row in data.items():
         client.set(SUITE_KEY + id, json.dumps({"status": row["status"], "detail": row["detail"][:300], "at": at}))
+    return 200, {"ok": True}
+
+
+# Async resources belong to the ASGI lifespan, one set per worker event loop.
+_http: httpx.AsyncClient | None = None
+_db_pool = None
+_db_kind: str | None = None
+_db_options: dict = {}
+_db_error: Exception | None = None
+
+
+async def aopen() -> None:
+    global _http, _db_pool, _db_kind, _db_options, _db_error
+
+    await aclose()
+    _http = httpx.AsyncClient(timeout=TIMEOUT, headers=BROWSER,
+                              verify=ssl.create_default_context(cafile=certifi.where()))
+    try:
+        configured = _database_options()
+        if configured is None:
+            return
+        _db_kind, _db_options = configured
+        async with asyncio.timeout(TIMEOUT):
+            if _db_kind == "mysql":
+                import asyncmy
+
+                _db_pool = await asyncmy.create_pool(minsize=0, maxsize=5, autocommit=True, **_db_options)
+            else:
+                from psycopg_pool import AsyncConnectionPool
+
+                _db_pool = AsyncConnectionPool(kwargs={**_db_options, "prepare_threshold": None},
+                                               min_size=0, max_size=5, open=False, timeout=TIMEOUT)
+                await _db_pool.open()
+    except Exception as exc:
+        _db_error = exc  # Bad configuration fails its row, rather than taking down every route.
+
+
+async def aclose() -> None:
+    global _http, _db_pool, _db_kind, _db_options, _db_error
+
+    http, pool, kind = _http, _db_pool, _db_kind
+    _http, _db_pool, _db_kind, _db_options, _db_error = None, None, None, {}, None
+    try:
+        if http is not None:
+            async with asyncio.timeout(TIMEOUT):
+                await http.aclose()
+    finally:
+        if pool is not None:
+            async with asyncio.timeout(TIMEOUT):
+                if kind == "mysql":
+                    pool.close()
+                    await pool.wait_closed()
+                else:
+                    await pool.close()
+
+
+def _aredis():
+    import app
+
+    if not (os.environ.get("REDIS_URL") or os.environ.get("LARAVEL_CLOUD_QUEUES_REDIS_URL")):
+        return None
+    return app.telemetry.astore
+
+
+async def _aget(url: str) -> httpx.Response:
+    if _http is None:
+        raise RuntimeError("checks.aopen() has not run")
+    async with asyncio.timeout(TIMEOUT):
+        return await _http.get(url)
+
+
+async def _agather(*calls):
+    tasks = [asyncio.create_task(call) for call in calls]
+    try:
+        return await asyncio.gather(*tasks)
+    except BaseException:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
+
+
+async def aoutbound_https(headers) -> Result:
+    if _http is None:
+        raise RuntimeError("checks.aopen() has not run")
+    async with asyncio.timeout(TIMEOUT):
+        async with _http.stream("GET", "https://pypi.org/simple/") as response:
+            response.raise_for_status()
+            async for _ in response.aiter_bytes():
+                break
+            return "pass", f"GET https://pypi.org/simple/ returned {response.status_code}", ""
+
+
+async def apython_version(headers) -> Result:
+    # Reading the pin is filesystem work; release fetching stays on the loop.
+    detail = await asyncio.to_thread(_python_pin)
+    if not isinstance(detail, str):
+        return detail
+    try:
+        response = await _aget(f"https://endoflife.date/api/python/{python_minor()}.json")
+        response.raise_for_status()
+        cycle = response.json()
+    except Exception as exc:
+        return "pass", f"{detail}; latest-patch comparison skipped ({type(exc).__name__})", ""
+    return _python_release(detail, cycle)
+
+
+async def aweb_event_loop(headers) -> Result:
+    started = time.monotonic()
+    await asyncio.gather(*(asyncio.sleep(0.2) for _ in range(50)))
+    token = LOOP_SECONDS.set(time.monotonic() - started)
+    try:
+        return web_event_loop(headers)
+    finally:
+        LOOP_SECONDS.reset(token)
+
+
+async def _close_writer(writer) -> None:
+    writer.close()
+    if not asyncio.current_task().cancelling():
+        async with asyncio.timeout(TIMEOUT):
+            await writer.wait_closed()
+
+
+async def aweb_websocket(headers) -> Result:
+    if not on_cloud():
+        return "skip", "Not on Laravel Cloud, so there is no proxy chain to test.", CLOUD_ONLY
+    host = _header(headers, "host").split(":")[0]
+    if not host:
+        return "fail", "request has no Host header", FAIL_HELP
+    key = base64.b64encode(os.urandom(16)).decode()
+    request = (f"GET /ws/echo HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+               f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n")
+    async with asyncio.timeout(TIMEOUT):
+        reader, writer = await asyncio.open_connection(host, 443, ssl=ssl.create_default_context(), server_hostname=host)
+        try:
+            writer.write(request.encode())
+            await writer.drain()
+            response = b""
+            while b"\r\n\r\n" not in response and len(response) < 16384:
+                chunk = await reader.read(min(4096, 16384 - len(response)))
+                if not chunk:
+                    break
+                response += chunk
+        finally:
+            await _close_writer(writer)
+    return _websocket_result(host, key, response)
+
+
+async def _astream_lines(reader, chunked: bool):
+    if not chunked:
+        while line := await reader.readline():
+            yield line
+        return
+    buffered = b""
+    while True:
+        size = int((await reader.readline()).split(b";", 1)[0].strip(), 16)
+        if size == 0:
+            return
+        if size > 2**20:
+            raise ValueError("stream chunk is too large")
+        buffered += await reader.readexactly(size)
+        if await reader.readexactly(2) != b"\r\n":
+            raise ValueError("invalid stream chunk ending")
+        while b"\n" in buffered:
+            line, buffered = buffered.split(b"\n", 1)
+            yield line
+        if len(buffered) > 2**20:
+            raise ValueError("stream line is too large")
+
+
+async def _aarrivals(host: str, path: str) -> list[float]:
+    import app
+
+    async with asyncio.timeout(app.STREAM_CHUNKS + 3):
+        started = time.monotonic()
+        reader, writer = await asyncio.open_connection(host, 443, ssl=ssl.create_default_context(), server_hostname=host)
+        try:
+            writer.write((f"GET {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: {BROWSER['User-Agent']}\r\n"
+                          "Connection: close\r\n\r\n").encode())
+            await writer.drain()
+            head = await reader.readuntil(b"\r\n\r\n")
+            if len(head) > 16384:
+                raise ValueError("stream headers are too large")
+            status = int(head.split(b"\r\n", 1)[0].split()[1])
+            if status != 200:
+                raise RuntimeError(f"{path} answered {status}")
+            got = dict(line.split(b":", 1) for line in head.lower().split(b"\r\n")[1:] if b":" in line)
+            arrivals = []
+            async for line in _astream_lines(reader, b"chunked" in got.get(b"transfer-encoding", b"")):
+                if line.startswith(b"data:"):
+                    arrivals.append(time.monotonic() - started)
+                    if len(arrivals) == app.STREAM_CHUNKS:
+                        break
+            return arrivals
+        finally:
+            await _close_writer(writer)
+
+
+async def aweb_streaming(headers) -> Result:
+    if not on_cloud():
+        return "skip", "Not on Laravel Cloud, so no proxy can buffer the response.", CLOUD_ONLY
+    host = _header(headers, "host").split(":")[0]
+    if not host:
+        return "fail", "request has no Host header", FAIL_HELP
+    plain, opted = await _agather(*(_aarrivals(host, path) for path in ("/api/stream", "/api/stream?accel=no")))
+    return _streaming_result(_streamed(plain), _streamed(opted))
+
+
+async def aweb_static(headers) -> Result:
+    if not on_cloud():
+        return "skip", "Not on Laravel Cloud, so no nginx serves public/.", CLOUD_ONLY
+    host = _header(headers, "host").split(":")[0]
+    if not host:
+        return "fail", "request has no Host header", FAIL_HELP
+    paths = [*STATIC, *STATIC_BLOCKED, "cloud-check-missing.txt"]
+    responses = await _agather(*(_aget(f"https://{host}/{path}") for path in paths))
+    answers = {path: (response.status_code, dict(response.headers), response.content)
+               for path, response in zip(paths, responses)}
+    # Fixture byte comparisons read public/ from disk, rather than doing network work in threads.
+    return await asyncio.to_thread(_static_result, answers)
+
+
+async def alog_socket(headers) -> Result:
+    if not on_cloud():
+        return "skip", "Not on Laravel Cloud, so logs go to stdout.", CLOUD_ONLY
+    address = os.environ.get("LARAVEL_CLOUD_LOG_SOCKET") or "unix:///tmp/cloud-init.sock"
+    try:
+        async with asyncio.timeout(2):
+            if address.startswith("unix://"):
+                _, writer = await asyncio.open_unix_connection(address[len("unix://"):])
+            else:
+                host, _, port = address.removeprefix("tcp://").rpartition(":")
+                _, writer = await asyncio.open_connection(host, int(port))
+            await _close_writer(writer)
+    except Exception as exc:
+        return "fail", f"could not connect to {address}: {type(exc).__name__}", (
+            "Logs fall back to stdout and may lose their levels (everything looks like info). Check the Cloud log socket is available to this process.")
+    return "pass", f"connected to {address}", ""
+
+
+async def aredis_ping(headers) -> Result:
+    client = _aredis()
+    if client is None:
+        return "skip", "REDIS_URL is not set", "Attach a Valkey cache to this environment to test it and to run queue jobs."
+    async with asyncio.timeout(TIMEOUT):
+        await client.ping()
+    return "pass", "PING returned PONG", ""
+
+
+async def adatabase_query(headers) -> Result:
+    if _db_error is not None:
+        raise _db_error
+    if not os.environ.get("DATABASE_URL"):
+        return "skip", "DATABASE_URL is not set", "Attach a database to this environment to test it."
+    if _db_pool is None:
+        raise RuntimeError("checks.aopen() has not opened the database pool")
+    async with asyncio.timeout(TIMEOUT):
+        if _db_kind == "mysql":
+            async with _db_pool.acquire() as conn, conn.cursor() as cursor:
+                await cursor.execute("SELECT 1")
+                assert tuple(await cursor.fetchone()) == (1,)
+        else:
+            async with _db_pool.connection() as conn, conn.cursor() as cursor:
+                await cursor.execute("SELECT 1")
+                assert tuple(await cursor.fetchone()) == (1,)
+    return _database_result(_db_kind, _db_options)
+
+
+async def adns_hosts(headers) -> Result:
+    client, database = _aredis(), _database()
+    hosts = {}
+    if client is not None:
+        hosts["redis"] = client.connection_pool.connection_kwargs.get("host")
+    if database is not None:
+        hosts[database[0]] = _db_options.get("host", database[1])
+    hosts = {label: host for label, host in hosts.items() if host}
+    if not hosts:
+        return "skip", "no Redis or database host configured", "Attach a Valkey cache or database to test its DNS name."
+
+    async def resolve(host):
+        try:
+            async with asyncio.timeout(TIMEOUT):
+                return bool(await asyncio.get_running_loop().getaddrinfo(host, None))
+        except (OSError, TimeoutError):
+            return False
+
+    found = await asyncio.gather(*(resolve(host) for host in hosts.values()))
+    detail = ", ".join(f"{host} {'resolved' if ok else 'did not resolve'}" for host, ok in zip(hosts.values(), found))
+    if all(found):
+        return "pass", detail, ""
+    return "fail", detail, "The app cannot look up the hostname of an attached service, so it cannot connect to it. Check the service is attached to this environment."
+
+
+async def asuite_result(id: str) -> Result:
+    client = _aredis()
+    async with asyncio.timeout(TIMEOUT):
+        saved = await client.get(SUITE_KEY + id) if client is not None else None
+    return _suite_result(saved)
+
+
+async def asave_suite(data: dict) -> tuple[int, dict]:
+    error = _suite_error(data)
+    if error:
+        return error
+    client = _aredis()
+    if client is None:
+        return 503, {"error": "REDIS_URL is not set"}
+    at = f"{datetime.now(timezone.utc):%Y-%m-%d %H:%M} UTC"
+    async with asyncio.timeout(TIMEOUT):
+        await _agather(*(client.set(SUITE_KEY + id, json.dumps(
+            {"status": row["status"], "detail": row["detail"][:300], "at": at})) for id, row in data.items()))
     return 200, {"ok": True}
 
 
@@ -799,7 +1175,82 @@ def _one(entry, headers) -> dict[str, str]:
             status, detail, help = fn(headers)
     except Exception as exc:
         status, detail, help = "fail", f"{type(exc).__name__}: {exc}", FAIL_HELP
-    return {"id": id, "label": label, "status": status, "detail": _scrub(detail)[:300], "help": help}
+    return _row(entry, (status, detail, help))
+
+
+def _row(entry, result: Result) -> dict[str, str]:
+    status, detail, help = result
+    return {"id": entry[1], "label": entry[2], "status": status, "detail": _scrub(detail)[:300], "help": help}
+
+
+def _groups(rows: list[dict]) -> dict:
+    groups: dict[str, list] = {}
+    for entry, row in zip(CHECKS, rows):
+        groups.setdefault(entry[0], []).append(row)
+    return {"groups": [{"name": name, "checks": rows} for name, rows in groups.items()]}
+
+
+def _busy_result() -> Result:
+    return "warn", "an earlier run of this check has not finished yet", (
+        "This check was still running from a previous request. If it stays like this, the service it talks to has stopped responding.")
+
+
+def _deadline_result() -> Result:
+    return "fail", f"no answer within {DEADLINE} s", (
+        "This check hung. The service it talks to accepted the connection but stopped responding.")
+
+
+ASYNC_CHECKS = {
+    "web.event_loop": aweb_event_loop, "web.websocket": aweb_websocket, "web.streaming": aweb_streaming,
+    "web.static": aweb_static, "logging.socket": alog_socket, "runtime.python": apython_version,
+    "runtime.https": aoutbound_https, "services.redis": aredis_ping, "services.database": adatabase_query,
+    "services.dns": adns_hosts,
+}
+SYNC_PROBES = {web_server, web_concurrency, web_port, stdlib_complete, packages_match, tmp_writable,
+               cpu_limit, memory_limit, subprocess_run, threads_run}
+
+
+def _sync_probe(entry, headers) -> Result:
+    id = entry[1]
+    with _running_lock:
+        if id in _running:
+            return _busy_result()
+        _running.add(id)
+    try:
+        return entry[3](headers)
+    finally:
+        with _running_lock:
+            _running.discard(id)
+
+
+async def _aone(entry, headers) -> dict[str, str]:
+    import app
+
+    _, id, _, fn, applies, tier = entry
+    deadline = asyncio.timeout(DEADLINE)
+    try:
+        async with deadline:
+            if not applies(app.SERVER, python_minor()):
+                result = "skip", f"Not run on {app.SERVER}: {applies.__doc__}", (
+                    "This check doesn't apply to this environment's server or Python version.")
+            elif tier == "full":
+                result = await asuite_result(id)
+            elif id in ASYNC_CHECKS:
+                result = await ASYNC_CHECKS[id](headers)
+            elif fn in SYNC_PROBES:
+                # Subprocess, /proc, sysconf, metadata and filesystem probes are sync by nature.
+                result = await asyncio.to_thread(_sync_probe, entry, headers)
+            else:
+                result = fn(headers)
+    except TimeoutError as exc:
+        result = _deadline_result() if deadline.expired() else ("fail", f"TimeoutError: {exc}", FAIL_HELP)
+    except Exception as exc:
+        result = "fail", f"{type(exc).__name__}: {exc}", FAIL_HELP
+    return _row(entry, result)
+
+
+async def arun(headers) -> dict:
+    return _groups(await asyncio.gather(*(_aone(entry, headers) for entry in CHECKS)))
 
 
 DEADLINE = 12  # seconds for the whole list; a check still running then is reported, not awaited
@@ -835,16 +1286,12 @@ def run(headers) -> dict:
     for thread in threads:
         thread.join(max(0, deadline - time.monotonic()))
     rows = []
-    for _, id, label, *_ in CHECKS:
+    for entry in CHECKS:
+        id = entry[1]
         if id in results:
             rows.append(results[id])
         elif id in busy:
-            rows.append({"id": id, "label": label, "status": "warn", "detail": "an earlier run of this check has not finished yet",
-                         "help": "This check was still running from a previous request. If it stays like this, the service it talks to has stopped responding."})
+            rows.append(_row(entry, _busy_result()))
         else:
-            rows.append({"id": id, "label": label, "status": "fail", "detail": f"no answer within {DEADLINE} s",
-                         "help": "This check hung. The service it talks to accepted the connection but stopped responding."})
-    groups: dict[str, list] = {}
-    for entry, row in zip(CHECKS, rows):
-        groups.setdefault(entry[0], []).append(row)
-    return {"groups": [{"name": name, "checks": checks} for name, checks in groups.items()]}
+            rows.append(_row(entry, _deadline_result()))
+    return _groups(rows)
