@@ -14,18 +14,25 @@ const step = (rate, duration, startTime, maxVUs) => ({
   preAllocatedVUs: Math.min(maxVUs, rate + 20), maxVUs, gracefulStop: '30s',
 });
 
+// STEPS=below,inside,above,down (req/s) resizes the steps for a server whose real capacity is far below 95 per pod,
+// e.g. sync gunicorn: STEPS=2,3,5,1 (3 workers) or STEPS=20,24,30,8 (3 workers x 8 threads). Same durations.
+const [BELOW, INSIDE, ABOVE, DOWN] = (__ENV.STEPS || '85,100,115,30').split(',').map(Number);
+// A saturated sync pod queues requests until the 60 s timeout; give k6 room to keep them in flight (cap 300).
+const vus = (rate) => Math.min(300, Math.max(20, rate * 60));
+
 export const scenarios = {
-  below: step(85, '120s', '0s', 250),
-  inside: step(100, '120s', '120s', 250),
-  above: step(115, '120s', '240s', 250),
-  down: step(30, '360s', '360s', 60),
+  below: step(BELOW, '120s', '0s', __ENV.STEPS ? vus(BELOW) : 250),
+  inside: step(INSIDE, '120s', '120s', __ENV.STEPS ? vus(INSIDE) : 250),
+  above: step(ABOVE, '120s', '240s', __ENV.STEPS ? vus(ABOVE) : 250),
+  down: step(DOWN, '360s', '360s', __ENV.STEPS ? vus(DOWN) : 60),
   stats: statsScenario('720s'),
 };
+const SHAPE = `below ${BELOW}/s 120 s; inside ${INSIDE}/s 120 s; above ${ABOVE}/s 120 s; down ${DOWN}/s 360 s`;
 
-export const options = { scenarios, thresholds: SAFETY, cloud: { name: `concurrency ${__ENV.ENV_NAME} pass ${__ENV.PASS}`, distribution: CLOUD.distribution } };
+export const options = { scenarios, thresholds: SAFETY, cloud: { name: `concurrency ${__ENV.ENV_NAME} pass ${__ENV.PASS}${__ENV.STEPS ? ` steps ${__ENV.STEPS}` : ''}`, distribution: CLOUD.distribution } };
 
 export function setup() {
-  return begin('concurrency.js', scenarios, 'below 85/s 120 s; inside 100/s 120 s; above 115/s 120 s; down 30/s 360 s');
+  return begin('concurrency.js', scenarios, SHAPE);
 }
 
 export function slow() {
