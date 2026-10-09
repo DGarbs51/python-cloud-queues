@@ -8,5 +8,5 @@ from laravel_cloud_logging import configure
 
 # JSON from the master too. No accesslog: Cloud's nginx already logs each request.
 logconfig_dict = configure()
-# Keep shutdown under Cloud's graceful shutdown timeout.
-graceful_timeout = 30
+# Under Cloud's 30 s shutdown budget minus its 5 s pre-drain (serve.GRACE for the other servers).
+graceful_timeout = 20
