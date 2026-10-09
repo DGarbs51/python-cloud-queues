@@ -86,7 +86,8 @@ async def app(scope: dict, receive, send) -> None:
                 handler.cancel()
                 # Let the cancellation finish, so no Redis or DB call outlives the request.
                 await asyncio.gather(handler, return_exceptions=True)
-                return
+        if handler.cancelled():
+            return  # the client hung up: nothing to answer
         status, headers, payload = handler.result()  # re-raises Boom for the server's error path
     await send({"type": "http.response.start", "status": status,
                 "headers": [(k.lower().encode("latin-1"), v.encode("latin-1")) for k, v in headers]})
@@ -174,6 +175,7 @@ async def _lifespan(receive, send) -> None:
     for task in tasks:
         task.cancel()
     await asyncio.gather(*tasks, return_exceptions=True)
+    await app_module.registry.aclose_producer()  # dispatch_async's producer for this loop
     await app_module.telemetry.aclose()
     await checks.aclose()
     await send({"type": "lifespan.shutdown.complete"})
