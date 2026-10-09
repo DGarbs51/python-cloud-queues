@@ -3,7 +3,7 @@
 app.py calls install() once with its registry, telemetry and logger. throughput.py never
 imports app, so there is no import cycle and the math below tests without Redis.
 
-Run state is one Redis hash per run (lcq-throughput:<run>): "count", "started_at", plus per
+Run state is one Redis hash per run (<KEY_PREFIX>throughput:<run>): "count", "started_at", plus per
 job uuid "d:" deliveries, "w:" wait (s) and "f:" finish time. The job writes with HSETNX, so
 a redelivery only bumps "d:" and counts as a duplicate.
 """
@@ -19,7 +19,9 @@ import uuid
 
 from laravel_cloud_queues import current_job
 
-PREFIX = "lcq-throughput:"
+from telemetry import KEY_PREFIX, TIMEOUT
+
+PREFIX = KEY_PREFIX + "throughput:"
 ACTIVE = PREFIX + "active"  # holds the run id of the one run allowed at a time
 # Delete the lock only if this run still owns it.
 RELEASE = "if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) end return 0"
@@ -32,6 +34,7 @@ MIN_JOBS_PER_S = 50
 MAX_P95_WAIT_MS = 15_000
 
 _telemetry = _log = tick = None  # set by install()
+_tasks: set[asyncio.Task[None]] = set()
 
 
 def deadline(count: int) -> float:
@@ -93,6 +96,26 @@ def _dispatch(run: str, count: int) -> None:
         pipe.execute()
 
 
+async def _adispatch(run: str, count: int) -> None:
+    try:
+        for _ in range(count):
+            async with asyncio.timeout(TIMEOUT):
+                await tick.dispatch_async(run, time.time())
+    except Exception as exc:
+        _log.exception("throughput dispatch failed", extra=dict(run=run))
+        pipe = _telemetry.astore.pipeline()
+        pipe.hset(PREFIX + run, "error", str(exc)[:200])
+        pipe.expire(PREFIX + run, TTL, nx=True)
+        async with asyncio.timeout(TIMEOUT):
+            await pipe.execute()
+
+
+def _dispatch_done(task: asyncio.Task[None]) -> None:
+    _tasks.discard(task)
+    if not task.cancelled() and (exc := task.exception()) is not None:
+        _log.error("throughput dispatch error could not be saved", exc_info=exc)
+
+
 def start(data: dict) -> tuple[int, dict]:
     """POST /api/throughput: returns (status, body)."""
     count = parse_count(data)
@@ -114,10 +137,67 @@ def start(data: dict) -> tuple[int, dict]:
     return 202, {"run": run}
 
 
+async def astart(data: dict) -> tuple[int, dict]:
+    """POST /api/throughput on the ASGI request loop."""
+    count = parse_count(data)
+    if isinstance(count, str):
+        return 400, {"error": count}
+    store, run = _telemetry.astore, uuid.uuid4().hex
+    ttl = int(deadline(count)) + 60
+    async with asyncio.timeout(TIMEOUT):
+        if not await store.set(ACTIVE, run, nx=True, ex=ttl):
+            return 409, {"error": "a throughput run is already active", "run": await store.get(ACTIVE)}
+        pipe = store.pipeline()
+        pipe.hset(PREFIX + run, mapping={"count": count, "started_at": time.time()})
+        pipe.expire(PREFIX + run, TTL)
+        await pipe.execute()
+    _log.info("throughput started", extra=dict(run=run, count=count))
+    task = asyncio.create_task(_adispatch(run, count))
+    _tasks.add(task)
+    task.add_done_callback(_dispatch_done)
+    return 202, {"run": run}
+
+
 def status(run: str) -> tuple[int, dict]:
     """GET /api/throughput/<run>: returns (status, body)."""
     store = _telemetry.store
     raw = store.hgetall(PREFIX + run)
+    code, body = _status(raw)
+    if code != 200 or "result" in raw or body["state"] == "running":
+        return code, body
+    # First finisher freezes the result so later polls (and late jobs) cannot change it.
+    pipe = store.pipeline()
+    pipe.hsetnx(PREFIX + run, "result", json.dumps(body))
+    pipe.expire(PREFIX + run, TTL, nx=True)  # the run may have expired since HGETALL
+    if not pipe.execute()[0]:
+        # Another process froze it first, maybe from a different snapshot; its answer is the answer.
+        return 200, json.loads(store.hget(PREFIX + run, "result"))
+    store.eval(RELEASE, 1, ACTIVE, run)
+    _log.info("throughput finished", extra=dict(run=run, verdict=body["verdict"],
+                                                jobs_per_s=body["jobs_per_s"], p95_ms=body["wait_ms"]["p95"]))
+    return 200, body
+
+
+async def astatus(run: str) -> tuple[int, dict]:
+    """GET /api/throughput/<run> on the ASGI request loop."""
+    store = _telemetry.astore
+    async with asyncio.timeout(TIMEOUT):
+        raw = await store.hgetall(PREFIX + run)
+        code, body = _status(raw)
+        if code != 200 or "result" in raw or body["state"] == "running":
+            return code, body
+        pipe = store.pipeline()
+        pipe.hsetnx(PREFIX + run, "result", json.dumps(body))
+        pipe.expire(PREFIX + run, TTL, nx=True)
+        if not (await pipe.execute())[0]:
+            return 200, json.loads(await store.hget(PREFIX + run, "result"))
+        await store.eval(RELEASE, 1, ACTIVE, run)
+    _log.info("throughput finished", extra=dict(run=run, verdict=body["verdict"],
+                                                jobs_per_s=body["jobs_per_s"], p95_ms=body["wait_ms"]["p95"]))
+    return 200, body
+
+
+def _status(raw: dict) -> tuple[int, dict]:
     if not raw:
         return 404, {"error": "unknown run"}
     if "result" in raw:
@@ -142,14 +222,4 @@ def status(run: str) -> tuple[int, dict]:
                 verdict="fail" if failed else verdict(count, processed, duplicates, jobs_per_s, wait_ms["p95"]))
     if failed:
         body["error"] = raw["error"]
-    # First finisher freezes the result so later polls (and late jobs) cannot change it.
-    pipe = store.pipeline()
-    pipe.hsetnx(PREFIX + run, "result", json.dumps(body))
-    pipe.expire(PREFIX + run, TTL, nx=True)  # the run may have expired since HGETALL
-    if not pipe.execute()[0]:
-        # Another process froze it first, maybe from a different snapshot; its answer is the answer.
-        return 200, json.loads(store.hget(PREFIX + run, "result"))
-    store.eval(RELEASE, 1, ACTIVE, run)
-    _log.info("throughput finished", extra=dict(run=run, verdict=body["verdict"],
-                                                jobs_per_s=jobs_per_s, p95_ms=wait_ms["p95"]))
     return 200, body
