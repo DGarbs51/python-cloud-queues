@@ -53,10 +53,13 @@ Every environment uses the same settings, so results compare across versions:
 - **Start command:** `python serve.py`. It execs the server named in `.web-server` with the
   command listed in `serve.py` (`[::]:$PORT`, workers from `WEB_CONCURRENCY`). The `python-3.x`
   environments may keep `uvicorn asgi:app --host :: --port $PORT`; it runs the same thing.
-- **App and Worker cluster:** `pro.g-2vcpu-4gb`, autoscaling 1–6 replicas (CPU 60%, memory 70%), scale-to-zero off.
-- **Worker cluster:** 4 processes of `laravel-cloud-queues work app:registry`. Don't add
-  `--stop-when-empty`: Cloud restarts any worker that exits, which the timeout case relies on.
-- **Valkey cache** attached (Cloud injects `REDIS_URL`) and `LARAVEL_CLOUD_QUEUES_BACKEND=redis`.
+- **App cluster:** `pro.g-2vcpu-4gb`, autoscaling 1–6 replicas (CPU 60%, memory 70%), scale-to-zero off.
+- **Managed queue** named `default`: Flex, `mq.flex.512mb`, 0–6 workers. Cloud injects
+  `LARAVEL_CLOUD_MANAGED_QUEUES_CONFIG`, which selects managed mode, and runs
+  `laravel-cloud-queues work --queue=default --sleep=0` with no target, so `pyproject.toml` names it
+  (`[tool.laravel-cloud-queues] target`). Don't set `LARAVEL_CLOUD_QUEUES_BACKEND`: an explicit backend
+  wins over the injected config.
+- **Valkey cache** attached (Cloud injects `REDIS_URL`): the jobs' telemetry and the `services.redis` row use it.
 - **Database** (optional) attached; Cloud injects `DATABASE_URL`. Set `DB_SSL_VERIFY=0` for
   Cloud's self-signed database proxy.
 - Deploy command empty. Build command: the `cloud-bootstrap` copy is temporary (see
