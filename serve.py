@@ -34,8 +34,8 @@ COMMANDS = {
                     "--log-config logging.json asgi:app",
     # json: prefix, or hypercorn reads the file as INI.
     "hypercorn-wsgi": "hypercorn --bind [::]:{port} --workers {workers} --log-config json:logging.json wsgi:app",
-    "hypercorn-asgi": "hypercorn --bind [::]:{port} --workers {workers} --worker-class uvloop "
-                      "--graceful-timeout {grace} --log-config json:logging.json asgi:app",
+    # probe: Cloud's generated start command (no worker flag), to test whether WEB_CONCURRENCY is honoured
+    "hypercorn-asgi": "hypercorn asgi:asgi:app --bind [::]:{port}",
     # -v 0: daphne prints its access log straight to stdout; Cloud's nginx already logs each request.
     "daphne": "daphne -v 0 --bind :: --port {port} asgi:app",
 }
