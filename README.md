@@ -54,7 +54,11 @@ Every environment uses the same settings, so results compare across versions:
   command listed in `serve.py` (`[::]:$PORT`, workers from `WEB_CONCURRENCY`). The `python-3.x`
   environments may keep `uvicorn asgi:app --host :: --port $PORT`; it runs the same thing.
 - **App cluster:** `pro.g-2vcpu-4gb`, autoscaling 1–6 replicas (CPU 60%, memory 70%), scale-to-zero off.
-- **Managed queue** named `default`: Flex, `mq.flex.512mb`, 0–6 workers. Cloud injects
+- **`WEB_CONCURRENCY`** set by hand to the proposed per-server defaults (Notion: "Python WEB_CONCURRENCY defaults by
+  server and interface"): ASGI servers one worker per core (`2`); WSGI process-model servers (gunicorn, uwsgi, granian
+  and hypercorn WSGI) `clamp((MiB − max(256, MiB/4)) / 150, 1, 16 × cores)`, `20` on this size; waitress and daphne
+  unset (single process). `serve.py` passes it to every server that takes a worker count.
+- **Managed queue** named `default`: Flex, `mq.flex.512mb`, 0–100 workers. Cloud injects
   `LARAVEL_CLOUD_MANAGED_QUEUES_CONFIG`, which selects managed mode, and runs
   `laravel-cloud-queues work --queue=default --sleep=0` with no target, so `pyproject.toml` names it
   (`[tool.laravel-cloud-queues] target`). Don't set `LARAVEL_CLOUD_QUEUES_BACKEND`: an explicit backend
