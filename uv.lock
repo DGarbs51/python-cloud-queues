@@ -712,7 +712,7 @@ wheels = [
 
 [[package]]
 name = "laravel-cloud-queues"
-version = "0.3.0"
+version = "0.4.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "anyio" },
@@ -722,9 +722,9 @@ dependencies = [
     { name = "laravel-cloud-logging" },
     { name = "typing-extensions" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/45/77/5df97c4b17e11501b80720126b0732eb084eb57565fdbaa63708284b1083/laravel_cloud_queues-0.3.0.tar.gz", hash = "sha256:38e2cd3773c354eb3405e2d0778338a52f0d22d95e5c857997da7ffc15624aae", size = 125247, upload-time = "2026-10-09T11:54:04.721Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/37/a8/0db8492c9b3208726ac6000c943ce1962ba8e1b49d1b52ddc1e8eed17712/laravel_cloud_queues-0.4.0.tar.gz", hash = "sha256:86d0c625c0d8e21bbc9e2ecb7d352a902ec2a48a96652267525a37a627680bb2", size = 126358, upload-time = "2026-10-09T14:26:20.283Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/2f/ad/4b3de4da2319f77803d8223e25bbf7a01f58e7def8391985ab2be1ec256f/laravel_cloud_queues-0.3.0-py3-none-any.whl", hash = "sha256:523805b9ff79209f314f782b75dca1a1e566f7baf687ef2ed982faa96b339b75", size = 130575, upload-time = "2026-10-09T11:54:03.248Z" },
+    { url = "https://files.pythonhosted.org/packages/3d/24/6278e72414c03e6407162aea13ddd2fb4a646f412774e141c2e5ffc0ff1c/laravel_cloud_queues-0.4.0-py3-none-any.whl", hash = "sha256:c1972f5d4078216b8f44f723448a94c725d55670a7a36efcd746943431eb662b", size = 131498, upload-time = "2026-10-09T14:26:18.671Z" },
 ]
 
 [package.optional-dependencies]
@@ -994,7 +994,7 @@ requires-dist = [
     { name = "httpx", specifier = ">=0.28.1" },
     { name = "hypercorn", extras = ["uvloop"], specifier = ">=0.18.0" },
     { name = "laravel-cloud-logging", specifier = "==0.4.0" },
-    { name = "laravel-cloud-queues", extras = ["redis"], specifier = ">=0.3.0" },
+    { name = "laravel-cloud-queues", extras = ["redis"], specifier = ">=0.4.0" },
     { name = "psycopg", extras = ["binary"], specifier = ">=3.3.6" },
     { name = "psycopg-pool", specifier = ">=3.3.3" },
     { name = "pymysql" },

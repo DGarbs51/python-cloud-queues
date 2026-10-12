@@ -152,6 +152,12 @@ def web_concurrency(headers) -> Result:
         # Set by hand on the async environments: one worker per whole core. Cloud has no ASGI case to compare with.
         return "pass", (f"WEB_CONCURRENCY={value}, hand-set; Cloud's generic Python formula gives {expected} ({inputs}). "
                         "Cloud has no ASGI case for a non-FastAPI app"), ""
+    # Proposed sync rule for process-model WSGI servers (Notion: "Python WEB_CONCURRENCY defaults by server and
+    # interface"): memory decides, after a max(256 MiB, 25%) reserve, capped at 16 per core.
+    sync = min(max(1, (mib - max(256, mib // 4)) // 150), 16 * cores)
+    if app.SERVER not in serve.ASGI and app.SERVER not in serve.SINGLE_PROCESS and int(value) == sync:
+        return "pass", (f"WEB_CONCURRENCY={value}, hand-set to the proposed sync rule; Cloud's generic Python formula "
+                        f"gives {expected} ({inputs})"), ""
     return "warn", f"generic Python formula gives {expected} ({inputs}); WEB_CONCURRENCY={value} differs (a hand-set override may explain it)", (
         "Cloud sizes WEB_CONCURRENCY from the nominal instance size at deploy, while Python sees the pod's cgroup. A mismatch "
         "means one of them is wrong, the instance was resized without a redeploy, or WEB_CONCURRENCY was set by hand.")
