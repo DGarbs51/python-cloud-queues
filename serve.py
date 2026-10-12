@@ -29,9 +29,8 @@ COMMANDS = {
     "granian-wsgi": "granian --interface wsgi --host :: --port {port} --workers {workers} --log-config logging.json wsgi:app",
     # --runtime-mode auto picks mt for any non-RSGI interface; st keeps one loop per worker. --backpressure is
     # explicit so granian's backlog/workers default can't cap in-flight requests below what a load test drives.
-    "granian-asgi": "granian --interface asgi --host :: --port {port} --workers {workers} --loop uvloop "
-                    "--runtime-mode st --backpressure 1024 --workers-kill-timeout {grace} "
-                    "--log-config logging.json asgi:app",
+    # probe: Cloud's generated start command (no worker flag), to test whether WEB_CONCURRENCY is honoured
+    "granian-asgi": "granian --interface asgi --host :: --port {port} asgi:app",
     # json: prefix, or hypercorn reads the file as INI.
     "hypercorn-wsgi": "hypercorn --bind [::]:{port} --workers {workers} --log-config json:logging.json wsgi:app",
     "hypercorn-asgi": "hypercorn --bind [::]:{port} --workers {workers} --worker-class uvloop "
