@@ -150,6 +150,14 @@ async def _handle(method: str, path: str, query: str, headers: Mapping[str, str]
         if path == "/api/throughput":
             async with asyncio.timeout(IO_TIMEOUT):
                 return json_response(*await throughput.astart(data))
+        if path == "/api/long":
+            if (seconds := app_module.long_seconds(data)) is None:
+                return app_module.LONG_INVALID
+            async with asyncio.timeout(IO_TIMEOUT):
+                at = time.time()
+                receipt = await app_module.long.dispatch_async(seconds)
+                await telemetry.aqueued(app_module.long.name, receipt.uuid, at, 0)
+            return json_response(200, {"uuid": receipt.uuid, "seconds": seconds})
         if path == "/api/suite-results":
             async with asyncio.timeout(IO_TIMEOUT):
                 return json_response(*await checks.asave_suite(data))
