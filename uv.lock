@@ -712,19 +712,20 @@ wheels = [
 
 [[package]]
 name = "laravel-cloud-queues"
-version = "0.4.0"
+version = "0.5.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "anyio" },
     { name = "boto3" },
     { name = "click" },
+    { name = "cryptography" },
     { name = "httpx" },
     { name = "laravel-cloud-logging" },
     { name = "typing-extensions" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/37/a8/0db8492c9b3208726ac6000c943ce1962ba8e1b49d1b52ddc1e8eed17712/laravel_cloud_queues-0.4.0.tar.gz", hash = "sha256:86d0c625c0d8e21bbc9e2ecb7d352a902ec2a48a96652267525a37a627680bb2", size = 126358, upload-time = "2026-10-09T14:26:20.283Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/80/6a/d06f493372647507dcee48f94a4540d09e6e1483b7e11d6c2df3ab558d38/laravel_cloud_queues-0.5.0.tar.gz", hash = "sha256:e08a05a93fec1e56d6896530988a779f4fb1a57e9fba4a98279e5b889426f29c", size = 135105, upload-time = "2026-10-13T00:49:52.117Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/3d/24/6278e72414c03e6407162aea13ddd2fb4a646f412774e141c2e5ffc0ff1c/laravel_cloud_queues-0.4.0-py3-none-any.whl", hash = "sha256:c1972f5d4078216b8f44f723448a94c725d55670a7a36efcd746943431eb662b", size = 131498, upload-time = "2026-10-09T14:26:18.671Z" },
+    { url = "https://files.pythonhosted.org/packages/2a/d1/1a6dac3a1d6729df4570e9b565d8973597ebed2c5df8590b9036262503ee/laravel_cloud_queues-0.5.0-py3-none-any.whl", hash = "sha256:5081bed4967b5b0a4bf265b5c03a7c5ee45cb5328406830808e3ab9bb75b114f", size = 142078, upload-time = "2026-10-13T00:49:50.717Z" },
 ]
 
 [package.optional-dependencies]
@@ -994,7 +995,7 @@ requires-dist = [
     { name = "httpx", specifier = ">=0.28.1" },
     { name = "hypercorn", extras = ["uvloop"], specifier = ">=0.18.0" },
     { name = "laravel-cloud-logging", specifier = "==0.4.0" },
-    { name = "laravel-cloud-queues", extras = ["redis"], specifier = ">=0.4.0" },
+    { name = "laravel-cloud-queues", extras = ["redis"], specifier = ">=0.5.0" },
     { name = "psycopg", extras = ["binary"], specifier = ">=3.3.6" },
     { name = "psycopg-pool", specifier = ">=3.3.3" },
     { name = "pymysql" },
