@@ -101,6 +101,13 @@ def timeout() -> None:
         time.sleep(TIMEOUT_SECONDS + 7)
 
 
+@registry.job(name="demo.long", tries=1, timeout=0)
+def long(seconds: int) -> None:
+    # A job longer than the platform allows (#SE-486): tries=1 and no job timeout, so only Cloud stops it.
+    with telemetry.tracked():
+        time.sleep(seconds)
+
+
 DISPATCHES = {  # kind: (job, delay seconds, how many)
     "quick": (quick, 0, 1),
     "async": (async_job, 0, 1),
@@ -256,6 +263,17 @@ def slow_seconds(query: str) -> int | None:
 SLOW_INVALID = json_response(400, {"error": f"seconds must be 1-{SLOW_MAX}"})
 
 
+LONG_MAX = 3600  # /api/long cap: past Flex's 90 s and the agent's 3-minute visibility window
+
+
+def long_seconds(data: dict) -> int | None:
+    seconds = data.get("seconds")
+    return seconds if isinstance(seconds, int) and not isinstance(seconds, bool) and 1 <= seconds <= LONG_MAX else None
+
+
+LONG_INVALID = json_response(400, {"error": f"seconds must be an integer from 1 to {LONG_MAX}"})
+
+
 def _handle(method: str, path: str, query: str, headers: Mapping[str, str], body: bytes, uploaded: int | None) -> Response:
     data = validate(method, path, headers, body, uploaded)
     if isinstance(data, tuple):
@@ -284,6 +302,13 @@ def _handle(method: str, path: str, query: str, headers: Mapping[str, str], body
             return json_response(200, {"ok": True})
         if path == "/api/throughput":
             return json_response(*throughput.start(data))
+        if path == "/api/long":
+            if (seconds := long_seconds(data)) is None:
+                return LONG_INVALID
+            at = time.time()
+            receipt = long.dispatch(seconds)
+            telemetry.queued(long.name, receipt.uuid, at, 0)
+            return json_response(200, {"uuid": receipt.uuid, "seconds": seconds})
         if path == "/api/suite-results":
             return json_response(*checks.save_suite(data))
         if path == "/api/reset":
@@ -401,6 +426,8 @@ def self_check() -> None:
     with patch(__name__ + ".run_check", return_value=False):
         assert handle("POST", "/api/check", {"Content-Type": "application/json"}, b"{}")[0] == 409
     assert handle("POST", "/api/dispatch/timeout", {"Content-Type": "application/json"}, b"{}")[0] == 404
+    for bad in (b"{}", b'{"seconds": 0}', b'{"seconds": true}', b'{"seconds": 3601}', b'{"seconds": "60"}'):
+        assert handle("POST", "/api/long", {"Content-Type": "application/json"}, bad)[0] == 400, bad
     assert handle("GET", "/api/log-test?marker=bad marker!", {}, b"")[0] == 400
     assert handle("GET", "/api/log-test?marker=m-1", {}, b"")[0] == 200
     try:
